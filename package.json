@@ -1,0 +1,16 @@
+{
+  "name": "deriv-volatility-burst-fader",
+  "version": "1.0.0",
+  "description": "Deriv Volatility Index scanner with H1/M15/M5 analysis and Strong Burst Fader logic",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.3"
+  }
+}
