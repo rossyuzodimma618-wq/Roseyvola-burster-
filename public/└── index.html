@@ -1,1 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
+  <title>Deriv Volatility Burst Fader</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: #07111f;
+      color: #ffffff;
+      min-height: 100vh;
+    }
+
+    header {
+      padding: 20px;
+      background: #0b1728;
+      border-bottom: 1px solid #20324a;
+    }
+
+    h1 {
+      font-size: 24px;
+      margin-bottom: 8px;
+    }
+
+    .subtitle {
+      color: #8fa5bd;
+      font-size: 13px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: auto;
+      padding: 20px;
+    }
+
+    .status-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .status-card {
+      background: #0d1b2e;
+      border: 1px solid #20324a;
+      border-radius: 12px;
+      padding: 15px;
+    }
+
+    .label {
+      color: #7f95ad;
+      font-size: 12px;
+      margin-bottom: 7px;
+    }
+
+    .value {
+      font-size: 20px;
+      font-weight: bold;
+    }
+
+    .online {
+      color: #38e88c;
+    }
+
+    .offline {
+      color: #ff5c6c;
+    }
+
+    .section-title {
+      font-size: 18px;
+      margin: 25px 0 12px;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 15px;
+    }
+
+    .card {
+      background: #0d1b2e;
+      border: 1px solid #20324a;
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 8px 25px rgba(0,0,0,0.18);
+    }
+
+    .symbol {
+      font-size: 18px;
+      font-weight: bold;
+      margin-bottom: 3px;
+    }
+
+    .price {
+      color: #8fa5bd;
+      font-size: 13px;
+      margin-bottom: 15px;
+    }
+
+    .signal {
+      padding: 11px;
+      border-radius: 9px;
+      text-align: center;
+      font-weight: bold;
+      margin-bottom: 14px;
+      background: #18273b;
+    }
+
+    .buy {
+      background: rgba(30, 210, 120, 0.15);
+      border: 1px solid #28d87d;
+      color: #45ef98;
+    }
+
+    .sell {
+      background: rgba(255, 70, 90, 0.15);
+      border: 1px solid #ff5366;
+      color: #ff6878;
+    }
+
+    .wait {
+      background: rgba(255, 190, 60, 0.12);
+      border: 1px solid #dba936;
+      color: #ffc84d;
+    }
+
+    .score {
+      text-align: center;
+      font-size: 15px;
+      margin-bottom: 15px;
+    }
+
+    .analysis {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+      margin-bottom: 15px;
+    }
+
+    .tf {
+      background: #111f32;
+      border-radius: 8px;
+      padding: 9px 5px;
+      text-align: center;
+    }
+
+    .tf small {
+      display: block;
+      color: #71869d;
+      font-size: 10px;
+      margin-bottom: 5px;
+    }
+
+    .tf strong {
+      font-size: 12px;
+    }
+
+    .bullish {
+      color: #43e994;
+    }
+
+    .bearish {
+      color: #ff6575;
+    }
+
+    .neutral {
+      color: #ffc94d;
+    }
+
+    .burst {
+      background: #111f32;
+      border-radius: 9px;
+      padding: 11px;
+      margin-bottom: 14px;
+      font-size: 13px;
+    }
+
+    .trade-levels {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 7px;
+    }
+
+    .level {
+      background: #111f32;
+      padding: 10px 5px;
+      border-radius: 8px;
+      text-align: center;
+    }
+
+    .level small {
+      display: block;
+      color: #71869d;
+      font-size: 10px;
+      margin-bottom: 5px;
+    }
+
+    .level strong {
+      font-size: 12px;
+    }
+
+    .entry {
+      color: #58b9ff;
+    }
+
+    .sl {
+      color: #ff6979;
+    }
+
+    .tp {
+      color: #43e994;
+    }
+
+    .empty {
+      background: #0d1b2e;
+      border: 1px solid #20324a;
+      border-radius: 12px;
+      padding: 25px;
+      color: #8fa5bd;
+      text-align: center;
+    }
+
+    .alerts {
+      margin-top: 10px;
+    }
+
+    .alert {
+      background: #0d1b2e;
+      border-left: 3px solid #3d9cff;
+      padding: 13px;
+      margin-bottom: 9px;
+      border-radius: 7px;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+
+    footer {
+      text-align: center;
+      padding: 30px 15px;
+      color: #657b93;
+      font-size: 11px;
+    }
+
+    @media (max-width: 500px) {
+      .container {
+        padding: 12px;
+      }
+
+      h1 {
+        font-size: 20px;
+      }
+
+      .cards {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+  <div class="container">
+    <h1>⚡ Deriv Volatility Burst Fader</h1>
+    <div class="subtitle">
+      H1 Direction → 15M Structure → 5M Entry + Strong Burst Fader
+    </div>
+  </div>
+</header>
+
+<div class="container">
+
+  <div class="status-bar">
+
+    <div class="status-card">
+      <div class="label">DERIV CONNECTION</div>
+      <div id="connection" class="value offline">Checking...</div>
+    </div>
+
+    <div class="status-card">
+      <div class="label">VOLATILITY INDICES</div>
+      <div id="symbols" class="value">0</div>
+    </div>
+
+    <div class="status-card">
+      <div class="label">LAST SCAN</div>
+      <div id="lastScan" class="value">--</div>
+    </div>
+
+  </div>
+
+  <div class="section-title">
+    📊 Market Scanner
+  </div>
+
+  <div id="cards" class="cards">
+    <div class="empty">
+      Connecting to Deriv and scanning Volatility indices...
+    </div>
+  </div>
+
+  <div class="section-title">
+    📲 Recent Telegram Alerts
+  </div>
+
+  <div id="alerts" class="alerts">
+    <div class="empty">
+      No alerts yet.
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  Deriv Volatility Burst Fader • H1 / 15M / 5M • Scanner & Alert System
+</footer>
+
+<script>
+
+  function formatPrice(value) {
+    if (value === null || value === undefined || value === "") {
+      return "--";
+    }
+
+    const number = Number(value);
+
+    if (isNaN(number)) {
+      return value;
+    }
+
+    if (number >= 1000) {
+      return number.toFixed(2);
+    }
+
+    if (number >= 100) {
+      return number.toFixed(3);
+    }
+
+    return number.toFixed(4);
+  }
+
+
+  function directionClass(direction) {
+
+    if (!direction) {
+      return "neutral";
+    }
+
+    const text = String(direction).toLowerCase();
+
+    if (text.includes("bull")) {
+      return "bullish";
+    }
+
+    if (text.includes("bear")) {
+      return "bearish";
+    }
+
+    return "neutral";
+  }
+
+
+  function signalClass(signal) {
+
+    if (!signal) {
+      return "wait";
+    }
+
+    const text = String(signal).toLowerCase();
+
+    if (text.includes("buy")) {
+      return "buy";
+    }
+
+    if (text.includes("sell")) {
+      return "sell";
+    }
+
+    return "wait";
+  }
+
+
+  function createCard(item) {
+
+    const signal = item.signal || "WAIT";
+
+    const h1 = item.h1 || item.h1Direction || "NEUTRAL";
+    const m15 = item.m15 || item.m15Direction || "NEUTRAL";
+    const m5 = item.m5 || item.m5Direction || "NEUTRAL";
+
+    const burst =
+      item.burstFader ||
+      item.burst ||
+      item.strongBurstFader ||
+      "NO BURST";
+
+    const score =
+      item.score !== undefined
+        ? item.score
+        : "--";
+
+    return `
+      <div class="card">
+
+        <div class="symbol">
+          ${item.displayName || item.symbol || "Volatility Index"}
+        </div>
+
+        <div class="price">
+          ${item.symbol || ""} • Price:
+          ${formatPrice(item.price)}
+        </div>
+
+        <div class="signal ${signalClass(signal)}">
+          ${signal}
+        </div>
+
+        <div class="score">
+          ⭐ Score: <strong>${score}/5</strong>
+        </div>
+
+        <div class="analysis">
+
+          <div class="tf">
+            <small>1 HOUR</small>
+            <strong class="${directionClass(h1)}">
+              ${h1}
+            </strong>
+          </div>
+
+          <div class="tf">
+            <small>15 MIN</small>
+            <strong class="${directionClass(m15)}">
+              ${m15}
+            </strong>
+          </div>
+
+          <div class="tf">
+            <small>5 MIN</small>
+            <strong class="${directionClass(m5)}">
+              ${m5}
+            </strong>
+          </div>
+
+        </div>
+
+        <div class="burst">
+          ⚡ Strong Burst Fader:
+          <strong>${burst}</strong>
+        </div>
+
+        <div class="trade-levels">
+
+          <div class="level">
+            <small>ENTRY</small>
+            <strong class="entry">
+              ${formatPrice(item.entry)}
+            </strong>
+          </div>
+
+          <div class="level">
+            <small>SL</small>
+            <strong class="sl">
+              ${formatPrice(item.sl)}
+            </strong>
+          </div>
+
+          <div class="level">
+            <small>TP</small>
+            <strong class="tp">
+              ${formatPrice(item.tp)}
+            </strong>
+          </div>
+
+        </div>
+
+      </div>
+    `;
+  }
+
+
+  async function loadStatus() {
+
+    try {
+
+      const response = await fetch(
+        "/api/status",
+        {
+          cache: "no-store"
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("API unavailable");
+      }
+
+      const data = await response.json();
+
+
+      const connected =
+        data.connected ??
+        data.online ??
+        data.derivConnected ??
+        false;
+
+      const connection =
+        document.getElementById("connection");
+
+      if (connected) {
+
+        connection.textContent = "ONLINE";
+        connection.className = "value online";
+
+      } else {
+
+        connection.textContent = "OFFLINE";
+        connection.className = "value offline";
+
+      }
+
+
+      const list =
+        data.symbols ||
+        data.markets ||
+        data.results ||
+        data.scans ||
+        [];
+
+
+      document.getElementById("symbols")
+        .textContent =
+          Array.isArray(list)
+            ? list.length
+            : (data.symbolCount || 0);
+
+
+      document.getElementById("lastScan")
+        .textContent =
+          data.lastScan
+            ? new Date(data.lastScan).toLocaleTimeString()
+            : new Date().toLocaleTimeString();
+
+
+      const cards =
+        document.getElementById("cards");
+
+
+      if (!Array.isArray(list) || list.length === 0) {
+
+        cards.innerHTML = `
+          <div class="empty">
+            No Volatility index data available yet.<br><br>
+            The bot is waiting for Deriv market data.
+          </div>
+        `;
+
+      } else {
+
+        cards.innerHTML =
+          list.map(createCard).join("");
+
+      }
+
+
+      const alerts =
+        data.alerts ||
+        data.recentAlerts ||
+        [];
+
+
+      const alertBox =
+        document.getElementById("alerts");
+
+
+      if (!Array.isArray(alerts) || alerts.length === 0) {
+
+        alertBox.innerHTML = `
+          <div class="empty">
+            No Telegram alerts yet.
+          </div>
+        `;
+
+      } else {
+
+        alertBox.innerHTML =
+          alerts.slice(0, 10).map(alert => {
+
+            const text =
+              typeof alert === "string"
+                ? alert
+                : (
+                    alert.message ||
+                    alert.text ||
+                    JSON.stringify(alert)
+                  );
+
+            return `
+              <div class="alert">
+                ${text}
+              </div>
+            `;
+
+          }).join("");
+
+      }
+
+    } catch (error) {
+
+      const connection =
+        document.getElementById("connection");
+
+      connection.textContent = "OFFLINE";
+      connection.className = "value offline";
+
+      document.getElementById("cards").innerHTML = `
+        <div class="empty">
+          Unable to connect to the bot server.<br><br>
+          Waiting for Railway / Deriv connection...
+        </div>
+      `;
+
+    }
+
+  }
+
+
+  loadStatus();
+
+  setInterval(loadStatus, 5000);
+
+</script>
+
+</body>
+</html>
