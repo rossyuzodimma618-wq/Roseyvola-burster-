@@ -3,70 +3,40 @@ const path = require("path");
 const WebSocket = require("ws");
 
 const app = express();
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
 const PORT = process.env.PORT || 3000;
 
 /*
 =========================================================
-DERIV VOLATILITY BURST FADER
----------------------------------------------------------
-1H  = Overall direction
-15M = Structure + liquidity
-5M  = Entry + Strong Burst Fader
+DERIV PUBLIC MARKET DATA
+=========================================================
+Current public endpoint:
+wss://api.derivws.com/trading/v1/options/ws/public
 
-This is an ALERT/SCANNER bot.
-It does NOT place trades automatically.
+No Deriv token is required for public market data.
 =========================================================
 */
 
-// IMPORTANT:
-// Do NOT add ?app_id=1089 here.
 const DERIV_WS_URL =
-  "wss://ws.binaryws.com/websockets/v3";
-
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN || "";
-
-const TELEGRAM_CHAT_ID =
-  process.env.TELEGRAM_CHAT_ID || "";
+  "wss://api.derivws.com/trading/v1/options/ws/public";
 
 /*
 =========================================================
-EXPRESS / DASHBOARD
+TELEGRAM
+=========================================================
+Optional.
+Add these Railway variables if you want Telegram alerts:
+
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
 =========================================================
 */
 
-app.use(express.json());
-
-app.use(
-  express.static(path.join(__dirname, "public"))
-);
-
-app.get("/", (req, res) => {
-  res.sendFile(
-    path.join(__dirname, "public", "index.html")
-  );
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    online: true,
-    service: "Deriv Volatility Burst Fader",
-    time: new Date().toISOString()
-  });
-});
-
-/*
-=========================================================
-TIMEFRAMES
-=========================================================
-*/
-
-const TIMEFRAMES = {
-  H1: 3600,
-  M15: 900,
-  M5: 300
-};
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
 /*
 =========================================================
@@ -74,133 +44,107 @@ SETTINGS
 =========================================================
 */
 
-const CANDLE_COUNT = 180;
+const H1_GRANULARITY = 3600;
+const M15_GRANULARITY = 900;
+const M5_GRANULARITY = 300;
+
+const CANDLE_COUNT = 250;
 
 const SCAN_INTERVAL_MS = 30000;
 
-const REQUEST_DELAY_MS = 300;
+const REQUEST_TIMEOUT_MS = 15000;
 
 const ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 
-const MAX_SYMBOLS = 100;
+/*
+Strong Burst Fader settings
+*/
+
+const EMA_PERIOD = 20;
+const ATR_PERIOD = 14;
+const BURST_ATR_MULTIPLIER = 2;
+
+const MAX_BURST_STACK = 6;
 
 /*
 =========================================================
-STATE
+GLOBAL STATE
 =========================================================
 */
 
-let derivWs = null;
+let ws = null;
+let wsConnected = false;
 
-let connected = false;
-
-let connecting = false;
-
-let reconnectTimer = null;
-
-let scanTimer = null;
-
-let scanning = false;
-
-let symbols = [];
-
-let lastScan = null;
-
-let lastError = null;
-
-let lastDerivMessage = null;
-
-const scanResults = [];
-
-const alertHistory = [];
-
-const lastAlertTimes = new Map();
-
-let requestCounter = 1000;
+let requestId = 1;
 
 const pendingRequests = new Map();
 
+let volatilitySymbols = [];
+
+let lastScan = null;
+
+let scannerRunning = false;
+
+const alertHistory = new Map();
+
+const scanResults = {};
+
 /*
 =========================================================
-HELPERS
+EXPRESS ROUTES
+=========================================================
+*/
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    online: true,
+    derivConnected: wsConnected,
+    marketCount: volatilitySymbols.length,
+    lastScan
+  });
+});
+
+app.get("/api/status", (req, res) => {
+  res.json({
+    ok: true,
+    online: true,
+    derivConnected: wsConnected,
+    symbolCount: volatilitySymbols.length,
+    symbols: volatilitySymbols,
+    lastScan,
+    results: Object.values(scanResults)
+  });
+});
+
+/*
+=========================================================
+UTILITY
 =========================================================
 */
 
 function sleep(ms) {
-  return new Promise(resolve => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function nextReqId() {
-  requestCounter += 1;
-  return requestCounter;
-}
+function roundPrice(value, decimals = 3) {
+  if (!Number.isFinite(value)) return null;
 
-function cleanNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function round(value, decimals = 5) {
-  if (!Number.isFinite(Number(value))) {
-    return null;
-  }
-
-  return Number(
-    Number(value).toFixed(decimals)
-  );
-}
-
-function symbolName(item) {
-  return (
-    item.underlying_symbol_name ||
-    item.display_name ||
-    item.symbol_display_name ||
-    item.symbol ||
-    item.underlying_symbol ||
-    "Unknown"
-  );
-}
-
-function symbolCode(item) {
-  return (
-    item.underlying_symbol ||
-    item.symbol ||
-    item.code ||
-    ""
-  );
-}
-
-function isVolatilitySymbol(item) {
-  const code = symbolCode(item);
-  const name = symbolName(item);
-
-  const text =
-    `${code} ${name}`.toLowerCase();
-
-  return (
-    text.includes("volatility") ||
-    /[0-9]+v/.test(text) ||
-    /hz[0-9]+v/.test(text) ||
-    /1s/.test(text) && text.includes("volatility")
-  );
+  return Number(value.toFixed(decimals));
 }
 
 function getDecimals(symbol) {
-  const code = symbol.toUpperCase();
+  const s = String(symbol || "").toUpperCase();
 
-  if (
-    code.includes("R_10") ||
-    code.includes("R_25") ||
-    code.includes("R_50") ||
-    code.includes("R_75") ||
-    code.includes("R_100")
-  ) {
+  if (s.includes("X")) {
     return 2;
   }
 
-  return 2;
+  return 3;
 }
 
 /*
@@ -210,201 +154,172 @@ WEBSOCKET CONNECTION
 */
 
 function connectDeriv() {
-  if (connecting || connected) {
-    return;
-  }
-
-  connecting = true;
-
-  console.log("Connecting to Deriv...");
-
-  lastError = null;
-
-  try {
-    derivWs = new WebSocket(DERIV_WS_URL);
-
-    derivWs.on("open", () => {
-      connected = true;
-      connecting = false;
-
-      console.log("Connected to Deriv.");
-
-      requestActiveSymbols();
-    });
-
-    derivWs.on("message", raw => {
-      handleDerivMessage(raw);
-    });
-
-    derivWs.on("error", error => {
-      connected = false;
-      connecting = false;
-
-      lastError =
-        error?.message ||
-        "Deriv WebSocket error";
-
-      console.error(
-        "Deriv WebSocket error:",
-        lastError
-      );
-    });
-
-    /*
-    This gives us the actual HTTP status/body if
-    the WebSocket handshake fails.
-    */
-    derivWs.on(
-      "unexpected-response",
-      (request, response) => {
-        connected = false;
-        connecting = false;
-
-        console.error(
-          "Deriv handshake failed:",
-          response.statusCode
-        );
-
-        let body = "";
-
-        response.on("data", chunk => {
-          body += chunk.toString();
-        });
-
-        response.on("end", () => {
-          console.error(
-            "Deriv handshake body:",
-            body
-          );
-
-          lastError =
-            `Deriv handshake failed: HTTP ${response.statusCode}` +
-            (body ? ` - ${body}` : "");
-        });
-      }
-    );
-
-    derivWs.on("close", () => {
-      connected = false;
-      connecting = false;
-
-      console.log(
-        "Deriv connection closed."
-      );
-
-      rejectPendingRequests(
-        "Deriv connection closed"
-      );
-
-      scheduleReconnect();
-    });
-
-  } catch (error) {
-    connected = false;
-    connecting = false;
-
-    lastError =
-      error?.message ||
-      "Connection error";
-
-    console.error(
-      "Connection exception:",
-      lastError
-    );
-
-    scheduleReconnect();
-  }
-}
-
-/*
-=========================================================
-RECONNECT
-=========================================================
-*/
-
-function scheduleReconnect() {
-  if (reconnectTimer) {
-    return;
-  }
-
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectDeriv();
-  }, 5000);
-}
-
-/*
-=========================================================
-PENDING REQUESTS
-=========================================================
-*/
-
-function rejectPendingRequests(reason) {
-  for (const [reqId, pending] of pendingRequests) {
-    clearTimeout(pending.timeout);
-
-    pending.reject(
-      new Error(reason)
-    );
-  }
-
-  pendingRequests.clear();
-}
-
-/*
-=========================================================
-SEND DERIV REQUEST
-=========================================================
-*/
-
-function sendDerivRequest(payload, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
-
-    if (
-      !derivWs ||
-      derivWs.readyState !== WebSocket.OPEN
-    ) {
-      reject(
-        new Error(
-          "Deriv WebSocket is not connected"
-        )
-      );
-
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      wsConnected = true;
+      resolve();
       return;
     }
 
-    const reqId = nextReqId();
+    console.log("Connecting to Deriv public WebSocket...");
 
-    const request = {
-      ...payload,
-      req_id: reqId
-    };
+    ws = new WebSocket(DERIV_WS_URL);
 
+    let settled = false;
+
+    const connectionTimeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+
+        try {
+          ws.close();
+        } catch (_) {}
+
+        reject(new Error("Deriv WebSocket connection timeout"));
+      }
+    }, REQUEST_TIMEOUT_MS);
+
+    ws.on("open", () => {
+      clearTimeout(connectionTimeout);
+
+      wsConnected = true;
+
+      console.log("Deriv public WebSocket connected.");
+
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    });
+
+    ws.on("message", raw => {
+      let data;
+
+      try {
+        data = JSON.parse(raw.toString());
+      } catch (error) {
+        console.log("Invalid Deriv message:", raw.toString());
+        return;
+      }
+
+      /*
+      Handle request/response messages.
+      */
+
+      if (data.req_id !== undefined) {
+        const request = pendingRequests.get(data.req_id);
+
+        if (request) {
+          pendingRequests.delete(data.req_id);
+
+          clearTimeout(request.timeout);
+
+          if (data.error) {
+            request.reject(
+              new Error(
+                data.error.message ||
+                data.error.code ||
+                "Deriv API error"
+              )
+            );
+          } else {
+            request.resolve(data);
+          }
+        }
+      }
+    });
+
+    ws.on("error", error => {
+      console.log(
+        "Deriv WebSocket error:",
+        error.message || error
+      );
+
+      wsConnected = false;
+
+      if (!settled) {
+        clearTimeout(connectionTimeout);
+
+        settled = true;
+
+        reject(error);
+      }
+    });
+
+    ws.on("close", (code, reason) => {
+      wsConnected = false;
+
+      console.log(
+        "Deriv WebSocket closed.",
+        code,
+        reason ? reason.toString() : ""
+      );
+
+      for (const [id, request] of pendingRequests.entries()) {
+        clearTimeout(request.timeout);
+
+        request.reject(
+          new Error("Deriv WebSocket closed")
+        );
+
+        pendingRequests.delete(id);
+      }
+
+      /*
+      Reconnect later.
+      */
+
+      setTimeout(() => {
+        if (!wsConnected) {
+          connectDeriv().catch(() => {});
+        }
+      }, 5000);
+    });
+  });
+}
+
+/*
+=========================================================
+SEND REQUEST
+=========================================================
+*/
+
+async function derivRequest(payload) {
+  await connectDeriv();
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    throw new Error("Deriv WebSocket is not open");
+  }
+
+  const id = requestId++;
+
+  const requestPayload = {
+    ...payload,
+    req_id: id
+  };
+
+  return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      pendingRequests.delete(reqId);
+      pendingRequests.delete(id);
 
       reject(
         new Error(
-          `Deriv request timeout: ${payload.msg_type || Object.keys(payload)[0]}`
+          `Deriv request timeout: ${payload.ticks_history || payload.active_symbols || "request"}`
         )
       );
-    }, timeoutMs);
+    }, REQUEST_TIMEOUT_MS);
 
-    pendingRequests.set(reqId, {
+    pendingRequests.set(id, {
       resolve,
       reject,
       timeout
     });
 
     try {
-      derivWs.send(
-        JSON.stringify(request)
-      );
+      ws.send(JSON.stringify(requestPayload));
     } catch (error) {
       clearTimeout(timeout);
-
-      pendingRequests.delete(reqId);
-
+      pendingRequests.delete(id);
       reject(error);
     }
   });
@@ -412,150 +327,98 @@ function sendDerivRequest(payload, timeoutMs = 15000) {
 
 /*
 =========================================================
-HANDLE DERIV MESSAGE
+GET ACTIVE SYMBOLS
 =========================================================
 */
 
-function handleDerivMessage(raw) {
-  try {
-    const data = JSON.parse(
-      raw.toString()
-    );
+async function getActiveSymbols() {
+  const data = await derivRequest({
+    active_symbols: "brief"
+  });
 
-    lastDerivMessage = data.msg_type || null;
-
-    if (data.error) {
-      const reqId = data.req_id;
-
-      if (
-        reqId &&
-        pendingRequests.has(reqId)
-      ) {
-        const pending =
-          pendingRequests.get(reqId);
-
-        clearTimeout(pending.timeout);
-
-        pendingRequests.delete(reqId);
-
-        pending.reject(
-          new Error(
-            `${data.error.code || "DerivError"}: ${
-              data.error.message || "Unknown error"
-            }`
-          )
-        );
-      }
-
-      console.error(
-        "Deriv API error:",
-        data.error
-      );
-
-      return;
-    }
-
-    const reqId = data.req_id;
-
-    if (
-      reqId &&
-      pendingRequests.has(reqId)
-    ) {
-      const pending =
-        pendingRequests.get(reqId);
-
-      clearTimeout(pending.timeout);
-
-      pendingRequests.delete(reqId);
-
-      pending.resolve(data);
-    }
-
-  } catch (error) {
-    console.error(
-      "Could not parse Deriv response:",
-      error.message
-    );
+  if (!Array.isArray(data.active_symbols)) {
+    throw new Error("Deriv returned no active symbols");
   }
-}
 
-/*
-=========================================================
-ACTIVE SYMBOLS
-=========================================================
-*/
+  const result = [];
 
-async function requestActiveSymbols() {
-  try {
+  for (const item of data.active_symbols) {
+    const symbol =
+      item.underlying_symbol ||
+      item.symbol;
+
+    const name =
+      item.underlying_symbol_name ||
+      item.display_name ||
+      symbol;
+
+    const type =
+      item.underlying_symbol_type ||
+      item.symbol_type ||
+      "";
+
+    const market =
+      item.market ||
+      "";
+
+    const combined =
+      `${symbol} ${name} ${type} ${market}`.toLowerCase();
+
     /*
-    Newer Deriv API versions removed some old filtering
-    parameters. We request the basic list and filter
-    Volatility indices locally.
+    Keep Volatility / synthetic style symbols.
+
+    Examples:
+    1HZ10V
+    1HZ25V
+    1HZ50V
+    1HZ75V
+    1HZ100V
+    1HZ150V
+    Volatility 10 Index
+    Volatility 25 Index
+    etc.
     */
-    const response =
-      await sendDerivRequest({
-        active_symbols: "brief"
-      });
 
-    const active =
-      Array.isArray(response.active_symbols)
-        ? response.active_symbols
-        : [];
+    const isVolatility =
+      combined.includes("volatility") ||
+      /^1hz\d+v/i.test(symbol || "") ||
+      /^r_\d+/i.test(symbol || "");
 
-    const volatility =
-      active.filter(
-        isVolatilitySymbol
-      );
+    if (!isVolatility) continue;
 
-    symbols = volatility
-      .map(item => ({
-        symbol: symbolCode(item),
-        name: symbolName(item),
-        market:
-          item.market ||
-          "synthetic",
-        type:
-          item.underlying_symbol_type ||
-          item.symbol_type ||
-          "synthetic",
-        open:
-          item.exchange_is_open !== 0
-      }))
-      .filter(item => item.symbol)
-      .slice(0, MAX_SYMBOLS);
-
-    console.log(
-      `Found ${symbols.length} Volatility indices.`
-    );
-
-    if (symbols.length === 0) {
-      console.log(
-        "No Volatility symbols were found."
-      );
-
-      console.log(
-        "Deriv returned:",
-        active.length,
-        "active symbols."
-      );
-    }
-
-    if (!scanTimer) {
-      startScanner();
-    }
-
-  } catch (error) {
-    lastError =
-      error?.message ||
-      "Could not get active symbols";
-
-    console.error(
-      "Active symbols error:",
-      lastError
-    );
-
-    scheduleReconnect();
+    result.push({
+      symbol,
+      name,
+      type,
+      market
+    });
   }
+
+  /*
+  Remove duplicates.
+  */
+
+  const unique = [];
+
+  const seen = new Set();
+
+  for (const item of result) {
+    if (!item.symbol) continue;
+
+    if (seen.has(item.symbol)) continue;
+
+    seen.add(item.symbol);
+
+    unique.push(item);
+  }
+
+  volatilitySymbols = unique;
+
+  console.log(
+    `Found ${volatilitySymbols.length} Volatility/synthetic symbols.`
+  );
+
+  return volatilitySymbols;
 }
 
 /*
@@ -564,35 +427,23 @@ GET CANDLES
 =========================================================
 */
 
-async function getCandles(
-  symbol,
-  granularity,
-  count = CANDLE_COUNT
-) {
-  const response =
-    await sendDerivRequest(
-      {
-        ticks_history: symbol,
-        end: "latest",
-        style: "candles",
-        granularity,
-        count,
-        subscribe: 0
-      },
-      20000
-    );
+async function getCandles(symbol, granularity) {
+  const data = await derivRequest({
+    ticks_history: symbol,
+    end: "latest",
+    count: CANDLE_COUNT,
+    style: "candles",
+    granularity,
+    subscribe: 0
+  });
 
-  if (
-    !Array.isArray(
-      response.candles
-    )
-  ) {
+  if (!Array.isArray(data.candles)) {
     throw new Error(
-      `No candles returned for ${symbol}`
+      `No candles returned for ${symbol} ${granularity}`
     );
   }
 
-  return response.candles
+  const candles = data.candles
     .map(c => ({
       time: Number(c.epoch),
       open: Number(c.open),
@@ -607,203 +458,162 @@ async function getCandles(
       Number.isFinite(c.low) &&
       Number.isFinite(c.close)
     )
-    .sort(
-      (a, b) => a.time - b.time
-    );
+    .sort((a, b) => a.time - b.time);
+
+  /*
+  Remove the currently forming candle.
+
+  We only analyze completed candles.
+  */
+
+  if (candles.length > 1) {
+    candles.pop();
+  }
+
+  return candles;
 }
 
 /*
 =========================================================
-INDICATORS
+EMA
 =========================================================
 */
 
-function ema(values, period = 20) {
-  if (
-    !Array.isArray(values) ||
-    values.length < period
-  ) {
+function calculateEMA(values, period) {
+  if (!Array.isArray(values) || values.length < period) {
     return null;
   }
 
   const multiplier =
     2 / (period + 1);
 
-  let value = 0;
+  let ema = 0;
 
-  for (
-    let i = 0;
-    i < period;
-    i++
-  ) {
-    value += values[i];
+  for (let i = 0; i < period; i++) {
+    ema += values[i];
   }
 
-  value /= period;
+  ema /= period;
 
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-    value =
-      (values[i] - value) *
-        multiplier +
-      value;
+  for (let i = period; i < values.length; i++) {
+    ema =
+      (values[i] - ema) * multiplier +
+      ema;
   }
 
-  return value;
+  return ema;
 }
 
-function trueRanges(candles) {
-  const tr = [];
+/*
+=========================================================
+ATR
+=========================================================
+*/
 
-  for (
-    let i = 0;
-    i < candles.length;
-    i++
-  ) {
-    if (i === 0) {
-      tr.push(
-        candles[i].high -
-        candles[i].low
-      );
-
-      continue;
-    }
-
-    const current =
-      candles[i];
-
-    const previous =
-      candles[i - 1];
-
-    tr.push(
-      Math.max(
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-            previous.close
-        ),
-
-        Math.abs(
-          current.low -
-            previous.close
-        )
-      )
-    );
-  }
-
-  return tr;
-}
-
-function atr(
-  candles,
-  period = 14
-) {
+function calculateATR(candles, period = ATR_PERIOD) {
   if (
-    candles.length <
-    period + 1
+    !Array.isArray(candles) ||
+    candles.length < period + 1
   ) {
     return null;
   }
 
-  const tr =
-    trueRanges(candles);
+  const trueRanges = [];
 
-  const recent =
-    tr.slice(-period);
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-  return (
-    recent.reduce(
-      (sum, value) =>
-        sum + value,
-      0
-    ) / recent.length
-  );
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    );
+
+    trueRanges.push(tr);
+  }
+
+  if (trueRanges.length < period) {
+    return null;
+  }
+
+  let atr = 0;
+
+  for (let i = 0; i < period; i++) {
+    atr += trueRanges[i];
+  }
+
+  atr /= period;
+
+  for (let i = period; i < trueRanges.length; i++) {
+    atr =
+      ((atr * (period - 1)) + trueRanges[i]) /
+      period;
+  }
+
+  return atr;
 }
 
-function rsi(
-  candles,
-  period = 14
-) {
-  if (
-    candles.length <
-    period + 1
-  ) {
+/*
+=========================================================
+RSI
+=========================================================
+*/
+
+function calculateRSI(candles, period = 14) {
+  if (candles.length < period + 2) {
     return null;
   }
 
   let gains = 0;
   let losses = 0;
 
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-    const change =
+  for (let i = 1; i <= period; i++) {
+    const difference =
       candles[i].close -
       candles[i - 1].close;
 
-    if (change >= 0) {
-      gains += change;
+    if (difference >= 0) {
+      gains += difference;
     } else {
-      losses += Math.abs(change);
+      losses += Math.abs(difference);
     }
   }
 
-  let avgGain =
+  let averageGain =
     gains / period;
 
-  let avgLoss =
+  let averageLoss =
     losses / period;
 
-  for (
-    let i = period + 1;
-    i < candles.length;
-    i++
-  ) {
-    const change =
+  for (let i = period + 1; i < candles.length; i++) {
+    const difference =
       candles[i].close -
       candles[i - 1].close;
 
     const gain =
-      change > 0
-        ? change
-        : 0;
+      difference > 0 ? difference : 0;
 
     const loss =
-      change < 0
-        ? Math.abs(change)
-        : 0;
+      difference < 0 ? Math.abs(difference) : 0;
 
-    avgGain =
-      ((avgGain *
-        (period - 1)) +
-        gain) /
+    averageGain =
+      ((averageGain * (period - 1)) + gain) /
       period;
 
-    avgLoss =
-      ((avgLoss *
-        (period - 1)) +
-        loss) /
+    averageLoss =
+      ((averageLoss * (period - 1)) + loss) /
       period;
   }
 
-  if (avgLoss === 0) {
+  if (averageLoss === 0) {
     return 100;
   }
 
   const rs =
-    avgGain / avgLoss;
+    averageGain / averageLoss;
 
-  return (
-    100 -
-    100 / (1 + rs)
-  );
+  return 100 - (100 / (1 + rs));
 }
 
 /*
@@ -812,376 +622,358 @@ STRONG BURST FADER
 =========================================================
 */
 
-function strongBurstFader(
-  candles
-) {
-  if (
-    candles.length <
-    30
-  ) {
+function strongBurstFader(candles) {
+  if (candles.length < EMA_PERIOD + ATR_PERIOD + 5) {
     return {
-      direction: "NEUTRAL",
+      signal: "NEUTRAL",
       stack: 0,
       heat: "COOL",
-      burst: false,
-      extreme: false,
       basis: null,
       upper: null,
       lower: null
     };
   }
-
-  /*
-  Use completed candle.
-  This prevents the current forming candle from
-  constantly changing the signal.
-  */
-  const completed =
-    candles.slice(0, -1);
 
   const closes =
-    completed.map(
-      c => c.close
-    );
+    candles.map(c => c.close);
+
+  const highs =
+    candles.map(c => c.high);
+
+  const lows =
+    candles.map(c => c.low);
 
   const basis =
-    ema(closes, 20);
+    calculateEMA(closes, EMA_PERIOD);
 
-  const atrValue =
-    atr(completed, 14);
+  const atr =
+    calculateATR(candles, ATR_PERIOD);
 
   if (
-    !Number.isFinite(basis) ||
-    !Number.isFinite(atrValue) ||
-    atrValue <= 0
+    basis === null ||
+    atr === null ||
+    atr <= 0
   ) {
     return {
-      direction: "NEUTRAL",
+      signal: "NEUTRAL",
       stack: 0,
       heat: "COOL",
-      burst: false,
-      extreme: false,
       basis: null,
       upper: null,
       lower: null
     };
   }
-
-  const candle =
-    completed[
-      completed.length - 1
-    ];
 
   const upper =
     basis +
-    2 * atrValue;
+    BURST_ATR_MULTIPLIER * atr;
 
   const lower =
     basis -
-    2 * atrValue;
+    BURST_ATR_MULTIPLIER * atr;
 
-  let stack = 0;
+  const candle =
+    candles[candles.length - 1];
 
-  let direction =
-    "NEUTRAL";
+  let upStack = 0;
+  let downStack = 0;
 
   /*
-  Wick pokes count.
+  Count ATR extension.
+
+  This keeps the Strong Burst Fader
+  as a supporting signal instead of
+  making it a mandatory gate.
   */
-  if (
-    candle.high >
-    upper
-  ) {
-    direction = "UP";
 
-    const extension =
-      candle.high -
-      upper;
-
-    stack =
+  if (candle.high > upper) {
+    upStack =
       Math.min(
-        6,
-        1 +
+        MAX_BURST_STACK,
+        Math.max(
+          1,
           Math.floor(
-            extension /
-              (0.5 *
-                atrValue)
+            (candle.high - basis) / atr
           )
+        )
       );
   }
 
-  if (
-    candle.low <
-    lower
-  ) {
-    const extension =
-      lower -
-      candle.low;
-
-    const downStack =
+  if (candle.low < lower) {
+    downStack =
       Math.min(
-        6,
-        1 +
+        MAX_BURST_STACK,
+        Math.max(
+          1,
           Math.floor(
-            extension /
-              (0.5 *
-                atrValue)
+            (basis - candle.low) / atr
           )
+        )
       );
-
-    if (
-      direction === "NEUTRAL" ||
-      downStack > stack
-    ) {
-      direction = "DOWN";
-      stack = downStack;
-    }
   }
+
+  let signal = "NEUTRAL";
+  let stack = 0;
+
+  if (upStack > downStack && upStack > 0) {
+    signal = "UP BURST";
+    stack = upStack;
+  }
+
+  if (downStack > upStack && downStack > 0) {
+    signal = "DOWN BURST";
+    stack = downStack;
+  }
+
+  /*
+  Heat
+  */
 
   let heat = "COOL";
 
-  if (stack >= 2) {
-    heat = "WARM";
-  }
-
-  if (stack >= 3) {
-    heat = "HOT";
-  }
-
-  if (stack >= 5) {
-    heat = "EXTREME";
-  }
+  if (stack >= 2) heat = "WARM";
+  if (stack >= 3) heat = "HOT";
+  if (stack >= 5) heat = "EXTREME";
 
   return {
-    direction,
+    signal,
     stack,
     heat,
-    burst: stack >= 1,
-    extreme: stack >= 5,
-    basis: round(basis, 4),
-    upper: round(upper, 4),
-    lower: round(lower, 4)
+    basis,
+    upper,
+    lower
   };
 }
 
 /*
 =========================================================
-STRUCTURE
+MARKET STRUCTURE
 =========================================================
 */
 
-function structureAnalysis(
-  candles
-) {
-  if (
-    candles.length <
-    30
-  ) {
+function analyzeStructure(candles) {
+  if (candles.length < 30) {
     return {
       direction: "NEUTRAL",
       structure: "NEUTRAL",
-      bos: false,
-      choch: false,
-      liquidity: "NONE"
+      bos: "NONE",
+      choch: "NONE"
     };
   }
 
-  const completed =
-    candles.slice(0, -1);
+  const closes =
+    candles.map(c => c.close);
+
+  const highs =
+    candles.map(c => c.high);
+
+  const lows =
+    candles.map(c => c.low);
+
+  const ema =
+    calculateEMA(closes, EMA_PERIOD);
+
+  if (ema === null) {
+    return {
+      direction: "NEUTRAL",
+      structure: "NEUTRAL",
+      bos: "NONE",
+      choch: "NONE"
+    };
+  }
 
   const last =
-    completed[
-      completed.length - 1
-    ];
+    candles[candles.length - 1];
 
   const previous =
-    completed[
-      completed.length - 2
-    ];
-
-  const lookback =
-    completed.slice(
-      -12,
-      -2
-    );
-
-  const recentHigh =
-    Math.max(
-      ...lookback.map(
-        c => c.high
-      )
-    );
-
-  const recentLow =
-    Math.min(
-      ...lookback.map(
-        c => c.low
-      )
-    );
-
-  let bos = false;
-  let choch = false;
-
-  let direction =
-    "NEUTRAL";
-
-  let liquidity =
-    "NONE";
+    candles[candles.length - 2];
 
   /*
-  BUY structure
+  Recent swing range.
   */
-  if (
-    last.close >
-    recentHigh
-  ) {
-    bos = true;
+
+  const lookback = 10;
+
+  const recentHighs =
+    highs.slice(
+      Math.max(0, highs.length - lookback - 1),
+      highs.length - 1
+    );
+
+  const recentLows =
+    lows.slice(
+      Math.max(0, lows.length - lookback - 1),
+      lows.length - 1
+    );
+
+  const previousHigh =
+    Math.max(...recentHighs);
+
+  const previousLow =
+    Math.min(...recentLows);
+
+  let direction = "NEUTRAL";
+  let bos = "NONE";
+  let choch = "NONE";
+
+  /*
+  Bullish structure.
+  */
+
+  if (last.close > ema) {
     direction = "BULLISH";
   }
 
   /*
-  SELL structure
+  Bearish structure.
   */
-  if (
-    last.close <
-    recentLow
-  ) {
-    bos = true;
+
+  if (last.close < ema) {
     direction = "BEARISH";
   }
 
   /*
-  Liquidity sweep:
-  wick takes a recent high/low and closes back inside.
+  BOS.
   */
-  if (
-    last.low <
-      recentLow &&
-    last.close >
-      recentLow
-  ) {
-    liquidity =
-      "SELL-SIDE SWEEP";
-    direction =
-      "BULLISH";
-    choch = true;
+
+  if (last.close > previousHigh) {
+    bos = "BULLISH BOS";
   }
 
-  if (
-    last.high >
-      recentHigh &&
-    last.close <
-      recentHigh
-  ) {
-    liquidity =
-      "BUY-SIDE SWEEP";
-    direction =
-      "BEARISH";
-    choch = true;
+  if (last.close < previousLow) {
+    bos = "BEARISH BOS";
   }
 
   /*
-  EMA backup direction.
-  This keeps the bot from becoming too strict.
+  CHoCH-style reversal detection.
   */
-  const closes =
-    completed.map(
-      c => c.close
-    );
-
-  const ema20 =
-    ema(closes, 20);
 
   if (
-    direction === "NEUTRAL" &&
-    Number.isFinite(ema20)
+    previous.close < ema &&
+    last.close > ema &&
+    last.close > previous.close
   ) {
-    if (
-      last.close >
-      ema20
-    ) {
-      direction =
-        "BULLISH";
-    } else if (
-      last.close <
-      ema20
-    ) {
-      direction =
-        "BEARISH";
-    }
+    choch = "BULLISH CHoCH";
+  }
+
+  if (
+    previous.close > ema &&
+    last.close < ema &&
+    last.close < previous.close
+  ) {
+    choch = "BEARISH CHoCH";
+  }
+
+  let structure = direction;
+
+  if (bos !== "NONE") {
+    structure = bos.includes("BULLISH")
+      ? "BULLISH"
+      : "BEARISH";
+  }
+
+  if (choch !== "NONE") {
+    structure = choch.includes("BULLISH")
+      ? "BULLISH"
+      : "BEARISH";
   }
 
   return {
     direction,
-    structure:
-      direction === "BULLISH"
-        ? "BULLISH"
-        : direction === "BEARISH"
-        ? "BEARISH"
-        : "NEUTRAL",
+    structure,
     bos,
-    choch,
-    liquidity
+    choch
   };
 }
 
 /*
 =========================================================
-ANALYZE TIMEFRAME
+LIQUIDITY SWEEP
 =========================================================
 */
 
-function analyzeTimeframe(
-  candles
-) {
-  if (
-    !candles ||
-    candles.length < 30
-  ) {
-    return {
-      direction: "NEUTRAL",
-      structure: "NEUTRAL",
-      bos: false,
-      choch: false,
-      liquidity: "NONE",
-      rsi: null,
-      atr: null,
-      price: null
-    };
+function detectLiquiditySweep(candles) {
+  if (candles.length < 20) {
+    return "NONE";
   }
 
-  const completed =
-    candles.slice(0, -1);
+  const current =
+    candles[candles.length - 1];
 
-  const closes =
-    completed.map(
-      c => c.close
+  const previousCandles =
+    candles.slice(
+      candles.length - 11,
+      candles.length - 1
     );
 
-  const last =
-    completed[
-      completed.length - 1
-    ];
+  const previousHigh =
+    Math.max(
+      ...previousCandles.map(c => c.high)
+    );
 
+  const previousLow =
+    Math.min(
+      ...previousCandles.map(c => c.low)
+    );
+
+  /*
+  Downside liquidity sweep:
+  wick below lows but closes back above.
+  */
+
+  if (
+    current.low < previousLow &&
+    current.close > previousLow
+  ) {
+    return "BEARISH LIQUIDITY SWEEP";
+  }
+
+  /*
+  Upside liquidity sweep:
+  wick above highs but closes back below.
+  */
+
+  if (
+    current.high > previousHigh &&
+    current.close < previousHigh
+  ) {
+    return "BULLISH LIQUIDITY SWEEP";
+  }
+
+  return "NONE";
+}
+
+/*
+=========================================================
+TIMEFRAME ANALYSIS
+=========================================================
+*/
+
+function analyzeTimeframe(candles) {
   const structure =
-    structureAnalysis(
-      candles
-    );
+    analyzeStructure(candles);
+
+  const rsi =
+    calculateRSI(candles);
+
+  const atr =
+    calculateATR(candles);
+
+  const burst =
+    strongBurstFader(candles);
+
+  const sweep =
+    detectLiquiditySweep(candles);
 
   return {
-    ...structure,
-
-    rsi: round(
-      rsi(completed, 14),
-      1
-    ),
-
-    atr: round(
-      atr(completed, 14),
-      5
-    ),
-
-    price: last.close
+    direction: structure.direction,
+    structure: structure.structure,
+    bos: structure.bos,
+    choch: structure.choch,
+    rsi,
+    atr,
+    burst,
+    sweep
   };
 }
 
@@ -1191,258 +983,177 @@ SIGNAL ENGINE
 =========================================================
 */
 
-function buildSignal(
+function generateSignal(
   symbol,
   candlesH1,
   candlesM15,
   candlesM5
 ) {
   const h1 =
-    analyzeTimeframe(
-      candlesH1
-    );
+    analyzeTimeframe(candlesH1);
 
   const m15 =
-    analyzeTimeframe(
-      candlesM15
-    );
+    analyzeTimeframe(candlesM15);
 
   const m5 =
-    analyzeTimeframe(
-      candlesM5
-    );
-
-  const burst =
-    strongBurstFader(
-      candlesM5
-    );
+    analyzeTimeframe(candlesM5);
 
   let score = 0;
 
-  let signal = "WAIT";
-
   /*
-  =========================================
-  1. H1 DIRECTION
-  =========================================
-  */
-
-  const h1Bull =
-    h1.direction ===
-    "BULLISH";
-
-  const h1Bear =
-    h1.direction ===
-    "BEARISH";
-
-  /*
-  =========================================
-  2. M15 ALIGNMENT
-  =========================================
+  1. H1 direction
   */
 
   if (
-    h1Bull &&
-    m15.direction ===
-      "BULLISH"
-  ) {
-    score++;
-  }
-
-  if (
-    h1Bear &&
-    m15.direction ===
-      "BEARISH"
+    h1.direction === "BULLISH" ||
+    h1.direction === "BEARISH"
   ) {
     score++;
   }
 
   /*
-  =========================================
-  3. M15 STRUCTURE
-  =========================================
+  2. M15 aligns with H1
   */
 
   if (
-    h1Bull &&
-    (
-      m15.bos ||
-      m15.choch ||
-      m15.direction ===
-        "BULLISH"
-    )
-  ) {
-    score++;
-  }
-
-  if (
-    h1Bear &&
-    (
-      m15.bos ||
-      m15.choch ||
-      m15.direction ===
-        "BEARISH"
-    )
+    h1.direction !== "NEUTRAL" &&
+    m15.direction === h1.direction
   ) {
     score++;
   }
 
   /*
-  =========================================
-  4. M5 STRUCTURE
-  =========================================
+  3. M15 structure
   */
 
   if (
-    h1Bull &&
-    (
-      m5.direction ===
-        "BULLISH" ||
-      m5.choch
-    )
-  ) {
-    score++;
-  }
-
-  if (
-    h1Bear &&
-    (
-      m5.direction ===
-        "BEARISH" ||
-      m5.choch
-    )
+    m15.structure === h1.direction &&
+    h1.direction !== "NEUTRAL"
   ) {
     score++;
   }
 
   /*
-  =========================================
-  5. BURST FADER
-  =========================================
+  4. M5 confirmation
+  */
+
+  if (
+    m5.structure === h1.direction &&
+    h1.direction !== "NEUTRAL"
+  ) {
+    score++;
+  }
+
+  /*
+  5. Strong Burst Fader support.
 
   IMPORTANT:
-  Burst Fader supports the setup.
-  It is NOT mandatory.
+  It is NOT required.
 
-  This prevents the bot from becoming
-  unnecessarily strict.
+  It simply adds one point when
+  it supports the reversal/entry idea.
   */
 
+  let burstSupport = false;
+
   if (
-    h1Bull &&
-    (
-      burst.direction ===
-        "DOWN" &&
-      burst.stack >= 2
-    )
+    h1.direction === "BULLISH" &&
+    m5.burst.signal === "DOWN BURST"
   ) {
-    score++;
+    burstSupport = true;
   }
 
   if (
-    h1Bear &&
-    (
-      burst.direction ===
-        "UP" &&
-      burst.stack >= 2
-    )
+    h1.direction === "BEARISH" &&
+    m5.burst.signal === "UP BURST"
   ) {
+    burstSupport = true;
+  }
+
+  if (burstSupport) {
     score++;
   }
 
   /*
-  =========================================
-  SIGNAL LOGIC
-  =========================================
+  -------------------------------------------------------
+  BUY
+  -------------------------------------------------------
   */
 
-  const buySetup =
-    h1Bull &&
-    m15.direction ===
-      "BULLISH" &&
-    (
-      m5.direction ===
-        "BULLISH" ||
-      m5.choch ||
-      (
-        burst.direction ===
-          "DOWN" &&
-        burst.stack >= 2
-      )
-    );
+  let signal = "WAIT";
 
-  const sellSetup =
-    h1Bear &&
-    m15.direction ===
-      "BEARISH" &&
-    (
-      m5.direction ===
-        "BEARISH" ||
-      m5.choch ||
-      (
-        burst.direction ===
-          "UP" &&
-        burst.stack >= 2
-      )
-    );
+  const bullishBase =
+    h1.direction === "BULLISH" &&
+    m15.direction === "BULLISH";
+
+  const bearishBase =
+    h1.direction === "BEARISH" &&
+    m15.direction === "BEARISH";
+
+  /*
+  BUY can happen through normal structure
+  OR through a downside burst/liquidity reaction.
+  */
 
   if (
-    buySetup &&
+    bullishBase &&
+    (
+      m5.structure === "BULLISH" ||
+      m5.burst.signal === "DOWN BURST" ||
+      m5.sweep === "BEARISH LIQUIDITY SWEEP"
+    ) &&
     score >= 3
   ) {
     signal = "BUY";
   }
 
+  /*
+  SELL
+  */
+
   if (
-    sellSetup &&
+    bearishBase &&
+    (
+      m5.structure === "BEARISH" ||
+      m5.burst.signal === "UP BURST" ||
+      m5.sweep === "BULLISH LIQUIDITY SWEEP"
+    ) &&
     score >= 3
   ) {
     signal = "SELL";
   }
 
   /*
-  =========================================
-  ENTRY / SL / TP
-  =========================================
+  Entry / SL / TP
   */
 
-  const completedM5 =
-    candlesM5.slice(0, -1);
-
-  const lastM5 =
-    completedM5[
-      completedM5.length - 1
-    ];
+  const last =
+    candlesM5[candlesM5.length - 1];
 
   const entry =
-    lastM5.close;
+    last.close;
 
-  const m5Atr =
-    atr(
-      completedM5,
-      14
-    ) || 0;
+  const decimals =
+    getDecimals(symbol);
 
-  const recentM5 =
-    completedM5.slice(-8);
+  const atr =
+    m5.atr ||
+    Math.abs(last.high - last.low);
 
-  let stopLoss =
-    null;
-
-  let takeProfit =
-    null;
+  let stopLoss = null;
+  let takeProfit = null;
 
   if (signal === "BUY") {
     const recentLow =
       Math.min(
-        ...recentM5.map(
-          c => c.low
-        )
+        ...candlesM5
+          .slice(-8)
+          .map(c => c.low)
       );
 
     stopLoss =
       recentLow -
-      m5Atr * 0.25;
+      atr * 0.20;
 
     const risk =
       entry - stopLoss;
@@ -1457,14 +1168,14 @@ function buildSignal(
   if (signal === "SELL") {
     const recentHigh =
       Math.max(
-        ...recentM5.map(
-          c => c.high
-        )
+        ...candlesM5
+          .slice(-8)
+          .map(c => c.high)
       );
 
     stopLoss =
       recentHigh +
-      m5Atr * 0.25;
+      atr * 0.20;
 
     const risk =
       stopLoss - entry;
@@ -1476,80 +1187,72 @@ function buildSignal(
     }
   }
 
-  const decimals =
-    getDecimals(symbol);
-
   return {
     symbol,
 
     signal,
 
-    score: Math.min(
-      score,
-      5
-    ),
+    score,
 
-    h1: {
-      direction:
-        h1.direction,
-      structure:
-        h1.structure
-    },
+    h1: h1.direction,
 
-    m15: {
-      direction:
-        m15.direction,
-      structure:
-        m15.structure,
-      bos:
-        m15.bos,
-      choch:
-        m15.choch,
-      liquidity:
-        m15.liquidity
-    },
+    m15: m15.direction,
 
-    m5: {
-      direction:
-        m5.direction,
-      structure:
-        m5.structure,
-      bos:
-        m5.bos,
-      choch:
-        m5.choch,
-      liquidity:
-        m5.liquidity,
-      rsi:
-        m5.rsi
-    },
+    m5: m5.direction,
 
-    burst: {
-      direction:
-        burst.direction,
-      stack:
-        burst.stack,
-      heat:
-        burst.heat,
-      burst:
-        burst.burst,
-      extreme:
-        burst.extreme
-    },
+    h1Structure: h1.structure,
+
+    m15Structure: m15.structure,
+
+    m5Structure: m5.structure,
+
+    h1BOS: h1.bos,
+
+    m15BOS: m15.bos,
+
+    m5BOS: m5.bos,
+
+    h1CHoCH: h1.choch,
+
+    m15CHoCH: m15.choch,
+
+    m5CHoCH: m5.choch,
+
+    rsi: m5.rsi
+      ? Number(m5.rsi.toFixed(1))
+      : null,
+
+    burstSignal:
+      m5.burst.signal,
+
+    burstStack:
+      m5.burst.stack,
+
+    burstHeat:
+      m5.burst.heat,
+
+    liquiditySweep:
+      m5.sweep,
 
     entry:
-      round(entry, decimals),
+      entry !== null
+        ? roundPrice(entry, decimals)
+        : null,
 
     stopLoss:
-      round(stopLoss, decimals),
+      stopLoss !== null
+        ? roundPrice(stopLoss, decimals)
+        : null,
 
     takeProfit:
-      round(takeProfit, decimals),
+      takeProfit !== null
+        ? roundPrice(takeProfit, decimals)
+        : null,
 
     price:
-      round(entry, decimals),
+      roundPrice(entry, decimals),
 
-    updated:
+    timestamp:
       new Date().toISOString()
   };
 }
@@ -1560,10 +1263,7 @@ TELEGRAM
 =========================================================
 */
 
-async function sendTelegram(
-  result,
-  displayName
-) {
+async function sendTelegram(message) {
   if (
     !TELEGRAM_BOT_TOKEN ||
     !TELEGRAM_CHAT_ID
@@ -1571,118 +1271,138 @@ async function sendTelegram(
     return;
   }
 
-  const key =
-    result.symbol;
-
-  const now =
-    Date.now();
-
-  const last =
-    lastAlertTimes.get(
-      key
-    ) || 0;
-
-  if (
-    now - last <
-    ALERT_COOLDOWN_MS
-  ) {
-    return;
-  }
-
-  lastAlertTimes.set(
-    key,
-    now
-  );
-
-  const emoji =
-    result.signal === "BUY"
-      ? "🟢"
-      : "🔴";
-
-  const message = [
-    `${emoji} STRONG ${result.signal}: ${displayName || result.symbol}`,
-    "",
-    `📍 Entry: ${result.entry}`,
-    `🛑 Stop Loss: ${result.stopLoss}`,
-    `🎯 Take Profit: ${result.takeProfit}`,
-    `⭐ Score: ${result.score}/5`,
-    "",
-    `📊 1H: ${result.h1.direction}`,
-    `📊 15M: ${result.m15.direction}`,
-    `📊 5M: ${result.m5.direction}`,
-    "",
-    `💥 Burst Fader: ${result.burst.direction}`,
-    `🔥 Burst Stack: ${result.burst.stack}/6`,
-    `🌡 Heat: ${result.burst.heat}`,
-    "",
-    `🔎 15M Liquidity: ${result.m15.liquidity}`,
-    `🔎 5M Liquidity: ${result.m5.liquidity}`,
-    `RSI: ${result.m5.rsi ?? "N/A"}`,
-    "",
-    `⏱ ${new Date().toUTCString()}`
-  ].join("\n");
-
-  const url =
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
   try {
+    const url =
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
     const response =
       await fetch(url, {
         method: "POST",
 
         headers: {
-          "Content-Type":
-            "application/json"
+          "Content-Type": "application/json"
         },
 
         body: JSON.stringify({
-          chat_id:
-            TELEGRAM_CHAT_ID,
-
+          chat_id: TELEGRAM_CHAT_ID,
           text: message
         })
       });
 
     if (!response.ok) {
-      console.error(
+      console.log(
         "Telegram error:",
-        await response.text()
+        response.status
       );
-
-      return;
     }
-
-    alertHistory.unshift({
-      symbol:
-        result.symbol,
-
-      signal:
-        result.signal,
-
-      score:
-        result.score,
-
-      time:
-        new Date().toISOString()
-    });
-
-    if (
-      alertHistory.length >
-      30
-    ) {
-      alertHistory.pop();
-    }
-
-    console.log(
-      `Telegram alert sent: ${result.signal} ${result.symbol}`
-    );
-
   } catch (error) {
-    console.error(
-      "Telegram send error:",
+    console.log(
+      "Telegram request error:",
       error.message
     );
   }
+}
+
+/*
+=========================================================
+ALERT MESSAGE
+=========================================================
+*/
+
+function createAlertMessage(result) {
+  const icon =
+    result.signal === "BUY"
+      ? "🟢"
+      : "🔴";
+
+  return (
+`${icon} STRONG ${result.signal}: ${result.symbol}
+
+📍 Entry: ${result.entry}
+🛑 Stop Loss: ${result.stopLoss}
+🎯 Take Profit: ${result.takeProfit}
+
+⭐ Score: ${result.score}/5
+
+📊 1H: ${result.h1}
+📊 15M: ${result.m15}
+📊 5M: ${result.m5}
+
+RSI: ${result.rsi ?? "N/A"}
+
+💥 Burst Fader: ${result.burstSignal}
+🔥 Burst Heat: ${result.burstHeat}
+📈 Burst Stack: ${result.burstStack}
+
+🔎 Liquidity: ${result.liquiditySweep}
+
+🏗 M15 Structure: ${result.m15Structure}
+🏗 M5 Structure: ${result.m5Structure}
+
+${result.m5BOS !== "NONE"
+    ? `💥 ${result.m5BOS}`
+    : ""}
+
+${result.m5CHoCH !== "NONE"
+    ? `🔄 ${result.m5CHoCH}`
+    : ""}
+
+⚖️ Risk/Reward: 1:2
+
+🤖 Deriv Volatility Burst Fader`
+  );
+}
+
+/*
+=========================================================
+SEND ALERT WITH COOLDOWN
+=========================================================
+*/
+
+async function maybeSendAlert(result) {
+  if (
+    result.signal !== "BUY" &&
+    result.signal !== "SELL"
+  ) {
+    return;
+  }
+
+  /*
+  Do not alert weak setups.
+  */
+
+  if (result.score < 3) {
+    return;
+  }
+
+  const key =
+    `${result.symbol}_${result.signal}`;
+
+  const now =
+    Date.now();
+
+  const lastAlert =
+    alertHistory.get(key) || 0;
+
+  if (
+    now - lastAlert <
+    ALERT_COOLDOWN_MS
+  ) {
+    return;
+  }
+
+  alertHistory.set(key, now);
+
+  const message =
+    createAlertMessage(result);
+
+  console.log(
+    "\n" +
+    message +
+    "\n"
+  );
+
+  await sendTelegram(message);
 }
 
 /*
@@ -1691,305 +1411,165 @@ SCAN ONE SYMBOL
 =========================================================
 */
 
-async function scanSymbol(
-  item
-) {
+async function scanSymbol(item) {
   const symbol =
     item.symbol;
 
   try {
-    const candlesH1 =
+    /*
+    Get H1.
+    */
+
+    const h1Candles =
       await getCandles(
         symbol,
-        TIMEFRAMES.H1
+        H1_GRANULARITY
       );
 
-    await sleep(
-      REQUEST_DELAY_MS
-    );
+    await sleep(250);
 
-    const candlesM15 =
+    /*
+    Get 15M.
+    */
+
+    const m15Candles =
       await getCandles(
         symbol,
-        TIMEFRAMES.M15
+        M15_GRANULARITY
       );
 
-    await sleep(
-      REQUEST_DELAY_MS
-    );
+    await sleep(250);
 
-    const candlesM5 =
+    /*
+    Get 5M.
+    */
+
+    const m5Candles =
       await getCandles(
         symbol,
-        TIMEFRAMES.M5
+        M5_GRANULARITY
       );
 
     if (
-      candlesH1.length < 30 ||
-      candlesM15.length < 30 ||
-      candlesM5.length < 30
+      h1Candles.length < 40 ||
+      m15Candles.length < 40 ||
+      m5Candles.length < 40
     ) {
+      console.log(
+        `Not enough candles for ${symbol}`
+      );
+
       return null;
     }
 
     const result =
-      buildSignal(
+      generateSignal(
         symbol,
-        candlesH1,
-        candlesM15,
-        candlesM5
+        h1Candles,
+        m15Candles,
+        m5Candles
       );
 
-    result.name =
+    result.displayName =
       item.name;
 
-    /*
-    Only alert BUY/SELL.
-    WAIT setups remain visible
-    on the dashboard.
-    */
-    if (
-      result.signal === "BUY" ||
-      result.signal === "SELL"
-    ) {
-      await sendTelegram(
-        result,
-        item.name
-      );
-    }
+    result.market =
+      item.market;
+
+    result.symbolType =
+      item.type;
+
+    scanResults[symbol] =
+      result;
+
+    await maybeSendAlert(result);
 
     return result;
 
   } catch (error) {
-    console.error(
-      `Scan error ${symbol}:`,
+    console.log(
+      `Scan error for ${symbol}:`,
       error.message
     );
 
-    return {
+    scanResults[symbol] = {
       symbol,
-      name: item.name,
+      displayName: item.name,
       signal: "WAIT",
       score: 0,
-      error:
-        error.message,
-      h1: {
-        direction: "NEUTRAL"
-      },
-      m15: {
-        direction: "NEUTRAL"
-      },
-      m5: {
-        direction: "NEUTRAL"
-      },
-      burst: {
-        direction: "NEUTRAL",
-        stack: 0,
-        heat: "COOL"
-      }
+      error: error.message,
+      timestamp:
+        new Date().toISOString()
     };
+
+    return null;
   }
 }
 
 /*
 =========================================================
-FULL SCAN
+SCAN ALL
 =========================================================
 */
 
-async function runScan() {
-  if (scanning) {
+async function scanAll() {
+  if (scannerRunning) {
+    console.log(
+      "Previous scan still running. Skipping."
+    );
+
     return;
   }
 
-  if (!connected) {
-    return;
-  }
-
-  if (
-    !symbols ||
-    symbols.length === 0
-  ) {
-    return;
-  }
-
-  scanning = true;
-
-  const results = [];
-
-  console.log(
-    `Starting scan of ${symbols.length} Volatility indices...`
-  );
+  scannerRunning = true;
 
   try {
-    for (
-      const item of symbols
+    /*
+    Refresh symbols if necessary.
+    */
+
+    if (
+      volatilitySymbols.length === 0
     ) {
-      if (!connected) {
-        break;
-      }
-
-      const result =
-        await scanSymbol(
-          item
-        );
-
-      if (result) {
-        results.push(
-          result
-        );
-      }
-
-      await sleep(
-        REQUEST_DELAY_MS
-      );
-    }
-
-    scanResults.length = 0;
-
-    for (
-      const result of results
-    ) {
-      scanResults.push(
-        result
-      );
+      await getActiveSymbols();
     }
 
     lastScan =
       new Date().toISOString();
 
     console.log(
-      `Scan complete: ${results.length} Volatility indices`
+      `\nScanning ${volatilitySymbols.length} Volatility symbols...`
+    );
+
+    /*
+    Sequential scanning reduces API pressure.
+    */
+
+    for (
+      const item of volatilitySymbols
+    ) {
+      await scanSymbol(item);
+
+      await sleep(250);
+    }
+
+    lastScan =
+      new Date().toISOString();
+
+    console.log(
+      "Scan completed:",
+      lastScan
     );
 
   } catch (error) {
-    lastError =
-      error.message;
-
-    console.error(
+    console.log(
       "Scanner error:",
       error.message
     );
-
   } finally {
-    scanning = false;
+    scannerRunning = false;
   }
 }
-
-/*
-=========================================================
-SCANNER START
-=========================================================
-*/
-
-function startScanner() {
-  if (scanTimer) {
-    return;
-  }
-
-  console.log(
-    "Scanner started."
-  );
-
-  runScan();
-
-  scanTimer =
-    setInterval(
-      runScan,
-      SCAN_INTERVAL_MS
-    );
-}
-
-/*
-=========================================================
-DASHBOARD API
-=========================================================
-*/
-
-app.get(
-  "/api/status",
-  (req, res) => {
-    res.json({
-      ok: true,
-
-      online: true,
-
-      connected,
-
-      connecting,
-
-      derivConnected:
-        connected,
-
-      marketOpen: true,
-
-      symbolCount:
-        symbols.length,
-
-      symbols:
-        symbols,
-
-      volatilityIndices:
-        symbols,
-
-      lastScan,
-
-      lastError,
-
-      lastDerivMessage,
-
-      scanning,
-
-      scanResults,
-
-      results:
-        scanResults,
-
-      scans:
-        scanResults,
-
-      alerts:
-        alertHistory,
-
-      recentAlerts:
-        alertHistory,
-
-      strategy: {
-        h1:
-          "Overall direction",
-
-        m15:
-          "Structure + liquidity",
-
-        m5:
-          "Entry + Strong Burst Fader",
-
-        riskReward:
-          "1:2"
-      },
-
-      burstFader: {
-        enabled: true,
-
-        mandatory: false,
-
-        basis:
-          "EMA20",
-
-        atr:
-          "ATR14",
-
-        band:
-          "2 ATR",
-
-        maximumStack: 6
-      },
-
-      time:
-        new Date().toISOString()
-    });
-  }
-);
 
 /*
 =========================================================
@@ -1997,17 +1577,61 @@ START SERVER
 =========================================================
 */
 
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `Deriv Volatility Burst Fader running on port ${PORT}`
+app.listen(PORT, async () => {
+  console.log(
+    `Deriv Volatility Burst Fader running on port ${PORT}`
+  );
+
+  console.log(
+    "Dashboard:",
+    `http://localhost:${PORT}`
+  );
+
+  try {
+    await connectDeriv();
+
+    await getActiveSymbols();
+
+    /*
+    First scan.
+    */
+
+    await scanAll();
+
+    /*
+    Continue scanning.
+    */
+
+    setInterval(
+      scanAll,
+      SCAN_INTERVAL_MS
     );
 
+  } catch (error) {
     console.log(
-      `Dashboard: http://localhost:${PORT}`
+      "Startup market-data error:",
+      error.message
     );
 
-    connectDeriv();
+    /*
+    Keep Railway server alive and retry.
+    */
+
+    setTimeout(() => {
+      connectDeriv()
+        .then(getActiveSymbols)
+        .then(scanAll)
+        .catch(err => {
+          console.log(
+            "Retry error:",
+            err.message
+          );
+        });
+    }, 10000);
+
+    setInterval(
+      scanAll,
+      SCAN_INTERVAL_MS
+    );
   }
-);
+});
