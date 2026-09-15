@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deriv Volatility Burst Fader</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #0b1020;
+      color: #ffffff;
+    }
+
+    header {
+      padding: 20px;
+      background: #11182d;
+      border-bottom: 1px solid #26304d;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 22px;
+    }
+
+    .subtitle {
+      color: #9da8c7;
+      font-size: 13px;
+    }
+
+    .status-bar {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      padding: 15px;
+    }
+
+    .stat {
+      background: #121a31;
+      border: 1px solid #273252;
+      border-radius: 12px;
+      padding: 15px;
+    }
+
+    .stat-label {
+      color: #8e9ab9;
+      font-size: 12px;
+    }
+
+    .stat-value {
+      margin-top: 6px;
+      font-size: 18px;
+      font-weight: bold;
+    }
+
+    #markets {
+      padding: 15px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 15px;
+    }
+
+    .card {
+      background: #121a31;
+      border: 1px solid #273252;
+      border-radius: 14px;
+      padding: 18px;
+    }
+
+    .symbol {
+      font-size: 19px;
+      font-weight: bold;
+    }
+
+    .price {
+      margin-top: 5px;
+      color: #aeb8d3;
+      font-size: 14px;
+    }
+
+    .signal {
+      margin: 15px 0;
+      padding: 12px;
+      border-radius: 10px;
+      text-align: center;
+      font-size: 18px;
+      font-weight: bold;
+      background: #202943;
+    }
+
+    .buy {
+      color: #42e695;
+    }
+
+    .sell {
+      color: #ff5c7a;
+    }
+
+    .wait {
+      color: #ffd166;
+    }
+
+    .rows {
+      display: grid;
+      gap: 8px;
+    }
+
+    .row {
+      display: flex;
+      justify-content: space-between;
+      padding: 9px 0;
+      border-bottom: 1px solid #202943;
+      font-size: 13px;
+    }
+
+    .label {
+      color: #8e9ab9;
+    }
+
+    .value {
+      font-weight: bold;
+    }
+
+    .levels {
+      margin-top: 15px;
+      padding-top: 10px;
+      border-top: 1px solid #273252;
+    }
+
+    .footer {
+      text-align: center;
+      padding: 20px;
+      color: #697593;
+      font-size: 12px;
+    }
+
+    .error {
+      margin: 15px;
+      padding: 15px;
+      border-radius: 10px;
+      background: #351827;
+      color: #ff8ca1;
+    }
+
+    @media (max-width: 600px) {
+      .status-bar {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+<header>
+  <h1>Deriv Volatility Burst Fader</h1>
+  <div class="subtitle">
+    H1 Direction → 15M Structure → 5M Entry
+  </div>
+</header>
+
+<section class="status-bar">
+
+  <div class="stat">
+    <div class="stat-label">Deriv Connection</div>
+    <div class="stat-value" id="connection">Checking...</div>
+  </div>
+
+  <div class="stat">
+    <div class="stat-label">Volatility Indices</div>
+    <div class="stat-value" id="count">0</div>
+  </div>
+
+  <div class="stat">
+    <div class="stat-label">Last Scan</div>
+    <div class="stat-value" id="lastScan">--</div>
+  </div>
+
+</section>
+
+<div id="error"></div>
+
+<section id="markets">
+  <div class="card">
+    Loading market data...
+  </div>
+</section>
+
+<div class="footer">
+  Strong Burst Fader is a supporting confirmation — not a mandatory filter.
+</div>
+
+<script>
+
+async function loadDashboard() {
+
+  try {
+
+    const response = await fetch("/api/status");
+
+    if (!response.ok) {
+      throw new Error("Dashboard API unavailable");
+    }
+
+    const data = await response.json();
+
+    document.getElementById("connection").textContent =
+      data.online || data.connected
+        ? "ONLINE"
+        : "OFFLINE";
+
+    const markets =
+      data.markets ||
+      data.symbols ||
+      data.results ||
+      data.scans ||
+      [];
+
+    document.getElementById("count").textContent =
+      markets.length;
+
+    document.getElementById("lastScan").textContent =
+      data.lastScan
+        ? new Date(data.lastScan).toLocaleTimeString()
+        : "--";
+
+    renderMarkets(markets);
+
+    document.getElementById("error").innerHTML = "";
+
+  } catch (error) {
+
+    document.getElementById("connection").textContent =
+      "OFFLINE";
+
+    document.getElementById("error").innerHTML =
+      `<div class="error">
+        Dashboard cannot connect to the server.
+        <br><br>
+        ${error.message}
+      </div>`;
+  }
+}
+
+
+function renderMarkets(markets) {
+
+  const container = document.getElementById("markets");
+
+  if (!markets.length) {
+
+    container.innerHTML = `
+      <div class="card">
+        No Volatility Index data available yet.
+      </div>
+    `;
+
+    return;
+  }
+
+  container.innerHTML = markets.map(market => {
+
+    const symbol =
+      market.symbol ||
+      market.displayName ||
+      market.name ||
+      market.underlying_symbol ||
+      "Unknown";
+
+    const price =
+      market.price ??
+      market.entry ??
+      "--";
+
+    const signal =
+      market.signal ||
+      "WAIT";
+
+    const score =
+      market.score ??
+      "--";
+
+    const h1 =
+      market.h1 ||
+      market.h1Direction ||
+      "--";
+
+    const m15 =
+      market.m15 ||
+      market.m15Direction ||
+      "--";
+
+    const m5 =
+      market.m5 ||
+      market.m5Direction ||
+      "--";
+
+    const burst =
+      market.burst ||
+      market.strongBurst ||
+      market.burstFader ||
+      "--";
+
+    const entry =
+      market.entry ??
+      "--";
+
+    const sl =
+      market.sl ??
+      market.stopLoss ??
+      "--";
+
+    const tp =
+      market.tp ??
+      market.takeProfit ??
+      "--";
+
+    let signalClass = "wait";
+
+    if (String(signal).toUpperCase().includes("BUY")) {
+      signalClass = "buy";
+    }
+
+    if (String(signal).toUpperCase().includes("SELL")) {
+      signalClass = "sell";
+    }
+
+    return `
+
+      <div class="card">
+
+        <div class="symbol">
+          ${symbol}
+        </div>
+
+        <div class="price">
+          Price: ${price}
+        </div>
+
+        <div class="signal ${signalClass}">
+          ${signal}
+        </div>
+
+        <div class="rows">
+
+          <div class="row">
+            <span class="label">Score</span>
+            <span class="value">${score}/5</span>
+          </div>
+
+          <div class="row">
+            <span class="label">1H Direction</span>
+            <span class="value">${h1}</span>
+          </div>
+
+          <div class="row">
+            <span class="label">15M Structure</span>
+            <span class="value">${m15}</span>
+          </div>
+
+          <div class="row">
+            <span class="label">5M Entry</span>
+            <span class="value">${m5}</span>
+          </div>
+
+          <div class="row">
+            <span class="label">Strong Burst Fader</span>
+            <span class="value">${burst}</span>
+          </div>
+
+        </div>
+
+        <div class="levels">
+
+          <div class="row">
+            <span class="label">Entry</span>
+            <span class="value">${entry}</span>
+          </div>
+
+          <div class="row">
+            <span class="label">Stop Loss</span>
+            <span class="value">${sl}</span>
+          </div>
+
+          <div class="row">
+            <span class="label">Take Profit</span>
+            <span class="value">${tp}</span>
+          </div>
+
+        </div>
+
+      </div>
+    `;
+
+  }).join("");
+}
+
+
+// Load immediately
+loadDashboard();
+
+// Refresh every 5 seconds
+setInterval(loadDashboard, 5000);
+
+</script>
+
+</body>
+</html>
