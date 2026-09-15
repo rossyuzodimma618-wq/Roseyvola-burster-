@@ -4,21 +4,34 @@ const WebSocket = require("ws");
 
 const app = express();
 
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
 const PORT = process.env.PORT || 3000;
+
+/*
+=========================================================
+DERIV
+=========================================================
+*/
 
 const DERIV_WS_URL =
   "wss://api.derivws.com/trading/v1/options/ws/public";
 
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN;
+/*
+=========================================================
+TELEGRAM
+=========================================================
+*/
 
-const TELEGRAM_CHAT_ID =
-  process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-
-// =====================================================
-// SETTINGS
-// =====================================================
+/*
+=========================================================
+SETTINGS
+=========================================================
+*/
 
 const H1_GRANULARITY = 3600;
 const M15_GRANULARITY = 900;
@@ -27,1679 +40,1269 @@ const M5_GRANULARITY = 300;
 const CANDLE_COUNT = 250;
 
 const SCAN_INTERVAL_MS = 30000;
-
 const REQUEST_TIMEOUT_MS = 15000;
 
-const ALERT_COOLDOWN_MS =
-  15 * 60 * 1000;
+const ALERT_COOLDOWN_MS = 15 * 60 * 1000;
 
-
-// =====================================================
-// EXPRESS
-// =====================================================
-
-app.use(express.json());
-
-app.use(
-  express.static(
-    path.join(__dirname, "public")
-  )
-);
-
-app.get("/", (req, res) => {
-  res.sendFile(
-    path.join(
-      __dirname,
-      "public",
-      "index.html"
-    )
-  );
-});
-
-app.get("/health", (req, res) => {
-  res.json({
-    ok: true,
-    online: true,
-    service:
-      "Deriv Volatility Burst Fader"
-  });
-});
-
-
-// =====================================================
-// STATE
-// =====================================================
+/*
+=========================================================
+STATE
+=========================================================
+*/
 
 const state = {
-
-  online: false,
-
-  connected: false,
-
-  lastScan: null,
-
-  symbols: [],
-
+  online: true,
+  derivConnected: false,
   markets: [],
-
+  lastScan: null,
   error: null
-
 };
 
+const alertState = new Map();
 
-const alertHistory = new Map();
+/*
+=========================================================
+BURST WARNING STATE
+=========================================================
 
-let ws = null;
+The warning system is NOT a trade filter.
 
-let requestId = 100;
+It simply warns:
 
-const pendingRequests =
-  new Map();
+Stack 2 = EARLY BURST WARNING
+Stack 3+ = STRONG BURST WARNING
 
+It does not stop normal BUY/SELL signals.
+=========================================================
+*/
 
-// =====================================================
-// WEBSOCKET CONNECTION
-// =====================================================
+const burstWarningState = new Map();
 
-function connectDeriv() {
+/*
+=========================================================
+UTILITY
+=========================================================
+*/
 
-  return new Promise(
-    (resolve, reject) => {
-
-      if (
-        ws &&
-        ws.readyState ===
-          WebSocket.OPEN
-      ) {
-        state.connected = true;
-        return resolve();
-      }
-
-      ws = new WebSocket(
-        DERIV_WS_URL
-      );
-
-      let settled = false;
-
-      const timer =
-        setTimeout(() => {
-
-          if (!settled) {
-
-            settled = true;
-
-            try {
-              ws.close();
-            } catch {}
-
-            reject(
-              new Error(
-                "Deriv WebSocket connection timeout"
-              )
-            );
-          }
-
-        }, REQUEST_TIMEOUT_MS);
-
-
-      ws.on(
-        "open",
-        () => {
-
-          clearTimeout(timer);
-
-          state.connected = true;
-          state.online = true;
-          state.error = null;
-
-          console.log(
-            "Deriv WebSocket connected"
-          );
-
-          if (!settled) {
-
-            settled = true;
-
-            resolve();
-          }
-
-        }
-      );
-
-
-      ws.on(
-        "message",
-        raw => {
-
-          let data;
-
-          try {
-
-            data =
-              JSON.parse(
-                raw.toString()
-              );
-
-          } catch {
-
-            return;
-
-          }
-
-
-          if (
-            data.req_id !==
-            undefined
-          ) {
-
-            const pending =
-              pendingRequests.get(
-                data.req_id
-              );
-
-            if (pending) {
-
-              pendingRequests.delete(
-                data.req_id
-              );
-
-              clearTimeout(
-                pending.timer
-              );
-
-
-              if (data.error) {
-
-                pending.reject(
-                  new Error(
-                    data.error.message ||
-                    JSON.stringify(
-                      data.error
-                    )
-                  )
-                );
-
-              } else {
-
-                pending.resolve(
-                  data
-                );
-
-              }
-
-            }
-
-          }
-
-        }
-      );
-
-
-      ws.on(
-        "close",
-        () => {
-
-          state.connected =
-            false;
-
-          state.online =
-            false;
-
-          console.log(
-            "Deriv WebSocket closed"
-          );
-
-        }
-      );
-
-
-      ws.on(
-        "error",
-        error => {
-
-          state.connected =
-            false;
-
-          state.error =
-            error.message;
-
-          console.log(
-            "Deriv WebSocket error:",
-            error.message
-          );
-
-          if (!settled) {
-
-            clearTimeout(timer);
-
-            settled = true;
-
-            reject(error);
-
-          }
-
-        }
-      );
-
-    }
-  );
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function round(value, decimals = 3) {
+  if (!Number.isFinite(value)) return null;
 
-// =====================================================
-// DERIV REQUEST
-// =====================================================
+  const factor = Math.pow(10, decimals);
 
-async function derivRequest(
-  payload
-) {
-
-  await connectDeriv();
-
-  const req_id =
-    ++requestId;
-
-  const requestPayload = {
-
-    ...payload,
-
-    req_id
-
-  };
-
-
-  console.log(
-    "Deriv request:",
-    JSON.stringify(
-      requestPayload
-    )
-  );
-
-
-  return new Promise(
-    (resolve, reject) => {
-
-      const timer =
-        setTimeout(() => {
-
-          pendingRequests.delete(
-            req_id
-          );
-
-          reject(
-            new Error(
-              "Deriv request timeout"
-            )
-          );
-
-        }, REQUEST_TIMEOUT_MS);
-
-
-      pendingRequests.set(
-        req_id,
-        {
-          resolve,
-          reject,
-          timer
-        }
-      );
-
-
-      try {
-
-        ws.send(
-          JSON.stringify(
-            requestPayload
-          )
-        );
-
-      } catch (error) {
-
-        clearTimeout(timer);
-
-        pendingRequests.delete(
-          req_id
-        );
-
-        reject(error);
-
-      }
-
-    }
-  );
+  return Math.round(value * factor) / factor;
 }
 
+function formatPrice(value, decimals = 3) {
+  if (!Number.isFinite(value)) return "N/A";
 
-// =====================================================
-// ACTIVE SYMBOLS
-// =====================================================
+  return Number(value).toFixed(decimals);
+}
 
-async function getActiveSymbols() {
+/*
+=========================================================
+SYMBOL DECIMALS
+=========================================================
+*/
 
-  const data =
-    await derivRequest({
+function getDecimals(symbol) {
+  const s = String(symbol || "").toUpperCase();
 
-      active_symbols:
-        "brief"
-
-    });
-
+  if (s.includes("XAU")) return 2;
 
   if (
-    !Array.isArray(
-      data.active_symbols
-    )
+    s.includes("JPY") ||
+    /^1HZ\d+V$/i.test(s)
   ) {
-
-    throw new Error(
-      "No active symbols returned by Deriv"
-    );
-
+    return 3;
   }
 
+  return 3;
+}
 
-  const found = [];
+/*
+=========================================================
+DERIV REQUEST
+=========================================================
+*/
 
+function derivRequest(requestPayload) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
 
-  for (
-    const item of
-    data.active_symbols
-  ) {
+    const ws = new WebSocket(DERIV_WS_URL);
 
+    const timeout = setTimeout(() => {
+      if (settled) return;
+
+      settled = true;
+
+      try {
+        ws.close();
+      } catch (_) {}
+
+      reject(
+        new Error(
+          `Deriv request timeout: ${JSON.stringify(requestPayload)}`
+        )
+      );
+    }, REQUEST_TIMEOUT_MS);
+
+    function finishError(error) {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch (_) {}
+
+      reject(error);
+    }
+
+    function finishSuccess(data) {
+      if (settled) return;
+
+      settled = true;
+      clearTimeout(timeout);
+
+      try {
+        ws.close();
+      } catch (_) {}
+
+      resolve(data);
+    }
+
+    ws.on("open", () => {
+      state.derivConnected = true;
+
+      console.log(
+        "Deriv request:",
+        JSON.stringify(requestPayload)
+      );
+
+      try {
+        ws.send(JSON.stringify(requestPayload));
+      } catch (error) {
+        finishError(error);
+      }
+    });
+
+    ws.on("message", raw => {
+      let data;
+
+      try {
+        data = JSON.parse(raw.toString());
+      } catch (error) {
+        return finishError(
+          new Error("Invalid JSON received from Deriv")
+        );
+      }
+
+      if (data.error) {
+        return finishError(
+          new Error(
+            data.error.message ||
+            data.error.code ||
+            "Deriv API error"
+          )
+        );
+      }
+
+      finishSuccess(data);
+    });
+
+    ws.on("error", error => {
+      state.derivConnected = false;
+
+      finishError(
+        new Error(
+          `Deriv WebSocket error: ${error.message}`
+        )
+      );
+    });
+
+    ws.on("close", () => {
+      if (!settled) {
+        state.derivConnected = false;
+      }
+    });
+  });
+}
+
+/*
+=========================================================
+ACTIVE VOLATILITY SYMBOLS
+=========================================================
+*/
+
+async function getActiveSymbols() {
+  const data = await derivRequest({
+    active_symbols: "brief"
+  });
+
+  const symbols = Array.isArray(data.active_symbols)
+    ? data.active_symbols
+    : [];
+
+  const result = [];
+
+  for (const item of symbols) {
     const symbol =
       item.underlying_symbol ||
       item.symbol ||
       "";
-
 
     const name =
       item.underlying_symbol_name ||
       item.display_name ||
       symbol;
 
-
     const type =
       item.underlying_symbol_type ||
       item.symbol_type ||
       "";
 
-
     const market =
       item.market ||
       "";
 
-
     const combined =
-      `${symbol} ${name} ${type} ${market}`
-        .toLowerCase();
-
+      `${symbol} ${name} ${type} ${market}`.toLowerCase();
 
     const isVolatility =
-      combined.includes(
-        "volatility"
-      ) ||
-      /^1hz\d+v/i.test(
-        symbol
-      ) ||
-      /^r_\d+/i.test(
-        symbol
-      );
+      combined.includes("volatility") ||
+      /^1hz\d+v/i.test(symbol) ||
+      /^r_\d+/i.test(symbol);
 
+    if (!isVolatility) continue;
 
-    if (
-      isVolatility &&
-      symbol
-    ) {
-
-      found.push({
-
-        symbol,
-
-        name,
-
-        market
-
-      });
-
-    }
-
+    result.push({
+      symbol,
+      name
+    });
   }
 
+  const unique = [];
+  const seen = new Set();
 
-  const unique =
-    Array.from(
-      new Map(
-        found.map(
-          x => [
-            x.symbol,
-            x
-          ]
-        )
-      ).values()
-    );
+  for (const item of result) {
+    if (!item.symbol) continue;
 
+    const key = item.symbol.toUpperCase();
 
-  state.symbols =
-    unique.map(
-      x => x.symbol
-    );
+    if (seen.has(key)) continue;
 
+    seen.add(key);
+    unique.push(item);
+  }
 
   return unique;
-
 }
 
-
-// =====================================================
-// CANDLE REQUEST
-// =====================================================
-//
-// Deriv's current public endpoint can validate
-// the "subscribe" field differently.
-//
-// We first try without subscribe.
-// If Deriv specifically complains about subscribe,
-// we retry with subscribe:false.
-// If necessary, we retry with subscribe:0.
-//
-// Both false and 0 mean:
-// DO NOT keep a live subscription.
-// =====================================================
+/*
+=========================================================
+CANDLE REQUEST
+=========================================================
+*/
 
 async function requestCandles(
   symbol,
   granularity,
   subscribeValue
 ) {
-
   const payload = {
-
-    ticks_history:
-      symbol,
-
-    end:
-      "latest",
-
-    count:
-      CANDLE_COUNT,
-
-    style:
-      "candles",
-
+    ticks_history: symbol,
+    end: "latest",
+    count: CANDLE_COUNT,
+    style: "candles",
     granularity
-
   };
 
-
-  if (
-    subscribeValue !==
-    undefined
-  ) {
-
-    payload.subscribe =
-      subscribeValue;
-
+  if (subscribeValue !== undefined) {
+    payload.subscribe = subscribeValue;
   }
 
+  const data = await derivRequest(payload);
 
-  const data =
-    await derivRequest(
-      payload
-    );
-
-
-  if (
-    !Array.isArray(
-      data.candles
-    )
-  ) {
-
+  if (!Array.isArray(data.candles)) {
     throw new Error(
       `No candles returned for ${symbol} ${granularity}`
     );
-
   }
 
-
   return data;
-
 }
 
+/*
+=========================================================
+GET CANDLES
+=========================================================
+*/
 
-async function getCandles(
-  symbol,
-  granularity
-) {
-
+async function getCandles(symbol, granularity) {
   try {
-
     return await requestCandles(
       symbol,
       granularity
     );
-
   } catch (firstError) {
+    const message = String(
+      firstError.message || ""
+    );
 
-    const message =
-      String(
-        firstError.message ||
-        ""
-      );
-
-
-    if (
-      !/subscribe/i.test(
-        message
-      )
-    ) {
-
+    if (!/subscribe/i.test(message)) {
       throw firstError;
-
     }
-
 
     console.log(
       `Retrying ${symbol} ${granularity} with subscribe:false`
     );
 
-
     try {
-
       return await requestCandles(
         symbol,
         granularity,
         false
       );
-
     } catch (secondError) {
+      const message2 = String(
+        secondError.message || ""
+      );
 
-      const message2 =
-        String(
-          secondError.message ||
-          ""
-        );
-
-
-      if (
-        !/subscribe/i.test(
-          message2
-        )
-      ) {
-
+      if (!/subscribe/i.test(message2)) {
         throw secondError;
-
       }
-
 
       console.log(
         `Retrying ${symbol} ${granularity} with subscribe:0`
       );
-
 
       return await requestCandles(
         symbol,
         granularity,
         0
       );
-
     }
-
   }
-
 }
 
+/*
+=========================================================
+CLEAN CANDLES
+=========================================================
+*/
 
-// =====================================================
-// CLEAN CANDLES
-// =====================================================
+function cleanCandles(data) {
+  const candles = Array.isArray(data.candles)
+    ? data.candles
+        .map(c => ({
+          epoch: Number(c.epoch),
+          open: Number(c.open),
+          high: Number(c.high),
+          low: Number(c.low),
+          close: Number(c.close)
+        }))
+        .filter(c =>
+          Number.isFinite(c.epoch) &&
+          Number.isFinite(c.open) &&
+          Number.isFinite(c.high) &&
+          Number.isFinite(c.low) &&
+          Number.isFinite(c.close)
+        )
+        .sort((a, b) => a.epoch - b.epoch)
+    : [];
 
-function cleanCandles(
-  data
-) {
+  /*
+    Remove the currently forming candle.
 
-  const candles =
-    data.candles
-      .map(
-        c => ({
+    We only analyse completed candles.
+  */
 
-          time:
-            Number(
-              c.epoch
-            ),
-
-          open:
-            Number(
-              c.open
-            ),
-
-          high:
-            Number(
-              c.high
-            ),
-
-          low:
-            Number(
-              c.low
-            ),
-
-          close:
-            Number(
-              c.close
-            )
-
-        })
-      )
-      .filter(
-        c =>
-
-          Number.isFinite(
-            c.time
-          ) &&
-
-          Number.isFinite(
-            c.open
-          ) &&
-
-          Number.isFinite(
-            c.high
-          ) &&
-
-          Number.isFinite(
-            c.low
-          ) &&
-
-          Number.isFinite(
-            c.close
-          )
-      )
-      .sort(
-        (a, b) =>
-          a.time - b.time
-      );
-
-
-  // Remove the currently forming candle.
-  if (
-    candles.length > 1
-  ) {
-
+  if (candles.length > 1) {
     candles.pop();
-
   }
-
 
   return candles;
-
 }
 
+/*
+=========================================================
+EMA
+=========================================================
+*/
 
-// =====================================================
-// EMA
-// =====================================================
-
-function ema(
-  values,
-  period
-) {
-
-  if (
-    values.length <
-    period
-  ) {
-
+function ema(values, period) {
+  if (!values || values.length < period) {
     return null;
-
   }
 
+  const multiplier = 2 / (period + 1);
 
-  const multiplier =
-    2 /
-    (period + 1);
+  let result = 0;
 
+  for (let i = 0; i < period; i++) {
+    result += values[i];
+  }
 
-  let result =
-    values
-      .slice(
-        0,
-        period
-      )
-      .reduce(
-        (a, b) =>
-          a + b,
-        0
-      ) /
-    period;
+  result /= period;
 
-
-  for (
-    let i = period;
-    i < values.length;
-    i++
-  ) {
-
+  for (let i = period; i < values.length; i++) {
     result =
-      (
-        values[i] -
-        result
-      ) *
-        multiplier +
+      (values[i] - result) * multiplier +
       result;
-
   }
-
 
   return result;
-
 }
 
+/*
+=========================================================
+ATR
+=========================================================
+*/
 
-// =====================================================
-// ATR
-// =====================================================
-
-function atr(
-  candles,
-  period = 14
-) {
-
-  if (
-    candles.length <
-    period + 1
-  ) {
-
+function atr(candles, period = 14) {
+  if (!candles || candles.length < period + 1) {
     return null;
-
   }
-
 
   const trs = [];
 
+  for (let i = 1; i < candles.length; i++) {
+    const current = candles[i];
+    const previous = candles[i - 1];
 
-  for (
-    let i = 1;
-    i < candles.length;
-    i++
-  ) {
-
-    const current =
-      candles[i];
-
-    const previous =
-      candles[i - 1];
-
-
-    const tr =
-      Math.max(
-
-        current.high -
-          current.low,
-
-        Math.abs(
-          current.high -
-          previous.close
-        ),
-
-        Math.abs(
-          current.low -
-          previous.close
-        )
-
-      );
-
+    const tr = Math.max(
+      current.high - current.low,
+      Math.abs(current.high - previous.close),
+      Math.abs(current.low - previous.close)
+    );
 
     trs.push(tr);
-
   }
 
-
-  if (
-    trs.length <
-    period
-  ) {
-
+  if (trs.length < period) {
     return null;
-
   }
 
+  let value = 0;
 
-  let result =
-    trs
-      .slice(
-        0,
-        period
-      )
-      .reduce(
-        (a, b) =>
-          a + b,
-        0
-      ) /
-    period;
+  for (let i = 0; i < period; i++) {
+    value += trs[i];
+  }
 
+  value /= period;
 
-  for (
-    let i = period;
-    i < trs.length;
-    i++
-  ) {
-
-    result =
-      (
-        result *
-          (period - 1) +
-        trs[i]
-      ) /
+  for (let i = period; i < trs.length; i++) {
+    value =
+      ((value * (period - 1)) + trs[i]) /
       period;
-
   }
 
-
-  return result;
-
+  return value;
 }
 
+/*
+=========================================================
+RSI
+=========================================================
+*/
 
-// =====================================================
-// RSI
-// =====================================================
-
-function rsi(
-  candles,
-  period = 14
-) {
-
-  if (
-    candles.length <
-    period + 1
-  ) {
-
+function rsi(candles, period = 14) {
+  if (!candles || candles.length < period + 1) {
     return null;
-
   }
-
 
   let gains = 0;
   let losses = 0;
 
-
-  for (
-    let i = 1;
-    i <= period;
-    i++
-  ) {
-
+  for (let i = 1; i <= period; i++) {
     const change =
       candles[i].close -
       candles[i - 1].close;
 
-
-    if (
-      change >= 0
-    ) {
-
+    if (change >= 0) {
       gains += change;
-
     } else {
-
-      losses -= change;
-
+      losses += Math.abs(change);
     }
-
   }
 
-
-  let avgGain =
-    gains / period;
-
-  let avgLoss =
-    losses / period;
-
+  let averageGain = gains / period;
+  let averageLoss = losses / period;
 
   for (
     let i = period + 1;
     i < candles.length;
     i++
   ) {
-
     const change =
       candles[i].close -
       candles[i - 1].close;
 
+    const gain = Math.max(change, 0);
+    const loss = Math.max(-change, 0);
 
-    const gain =
-      change > 0
-        ? change
-        : 0;
-
-
-    const loss =
-      change < 0
-        ? -change
-        : 0;
-
-
-    avgGain =
-      (
-        avgGain *
-          (period - 1) +
-        gain
-      ) /
+    averageGain =
+      ((averageGain * (period - 1)) + gain) /
       period;
 
-
-    avgLoss =
-      (
-        avgLoss *
-          (period - 1) +
-        loss
-      ) /
+    averageLoss =
+      ((averageLoss * (period - 1)) + loss) /
       period;
-
   }
 
+  if (averageLoss === 0) {
+    return 100;
+  }
+
+  const rs = averageGain / averageLoss;
+
+  return 100 - (100 / (1 + rs));
+}
+
+/*
+=========================================================
+DIRECTION
+=========================================================
+*/
+
+function getDirection(candles) {
+  if (!candles || candles.length < 25) {
+    return "NEUTRAL";
+  }
+
+  const closes = candles.map(c => c.close);
+
+  const basis = ema(closes, 20);
+
+  const last = candles[candles.length - 1];
+
+  const lookback =
+    candles[candles.length - 6];
+
+  if (!Number.isFinite(basis)) {
+    return "NEUTRAL";
+  }
 
   if (
-    avgLoss === 0
+    last.close > basis &&
+    last.close > lookback.close
   ) {
-
-    return 100;
-
+    return "BULLISH";
   }
 
+  if (
+    last.close < basis &&
+    last.close < lookback.close
+  ) {
+    return "BEARISH";
+  }
 
-  const rs =
-    avgGain /
-    avgLoss;
+  return "NEUTRAL";
+}
 
+/*
+=========================================================
+STRUCTURE / BOS / CHoCH
+=========================================================
+*/
 
-  return (
-    100 -
-    100 /
-      (1 + rs)
+function getStructure(candles) {
+  if (!candles || candles.length < 15) {
+    return "NEUTRAL";
+  }
+
+  const last = candles[candles.length - 1];
+
+  const previous = candles.slice(
+    Math.max(0, candles.length - 12),
+    candles.length - 2
   );
 
-}
-
-
-// =====================================================
-// DIRECTION
-// =====================================================
-
-function getDirection(
-  candles
-) {
-
-  if (
-    candles.length < 30
-  ) {
-
+  if (!previous.length) {
     return "NEUTRAL";
-
   }
 
+  const highest = Math.max(
+    ...previous.map(c => c.high)
+  );
 
-  const closes =
-    candles.map(
-      c => c.close
-    );
+  const lowest = Math.min(
+    ...previous.map(c => c.low)
+  );
 
+  if (last.close > highest) {
+    return "BULLISH BOS";
+  }
 
-  const ema20 =
-    ema(
-      closes,
-      20
-    );
+  if (last.close < lowest) {
+    return "BEARISH BOS";
+  }
 
+  const before = candles[
+    candles.length - 2
+  ];
 
   if (
-    ema20 === null
+    last.close > before.close &&
+    last.high >= before.high
   ) {
-
-    return "NEUTRAL";
-
+    return "BULLISH CONTINUATION";
   }
-
-
-  const last =
-    candles[
-      candles.length - 1
-    ];
-
-
-  const previous =
-    candles[
-      candles.length - 6
-    ];
-
 
   if (
-    last.close >
-      ema20 &&
-    last.close >
-      previous.close
+    last.close < before.close &&
+    last.low <= before.low
   ) {
-
-    return "BULLISH";
-
+    return "BEARISH CONTINUATION";
   }
-
-
-  if (
-    last.close <
-      ema20 &&
-    last.close <
-      previous.close
-  ) {
-
-    return "BEARISH";
-
-  }
-
 
   return "NEUTRAL";
-
 }
 
+/*
+=========================================================
+LIQUIDITY SWEEP
+=========================================================
+*/
 
-// =====================================================
-// BOS / CHoCH STRUCTURE
-// =====================================================
-
-function getStructure(
-  candles
-) {
-
-  if (
-    candles.length < 20
-  ) {
-
-    return "NEUTRAL";
-
-  }
-
-
-  const recent =
-    candles.slice(
-      -12
-    );
-
-
-  let highest =
-    -Infinity;
-
-  let lowest =
-    Infinity;
-
-
-  for (
-    let i = 0;
-    i < recent.length - 2;
-    i++
-  ) {
-
-    highest =
-      Math.max(
-        highest,
-        recent[i].high
-      );
-
-    lowest =
-      Math.min(
-        lowest,
-        recent[i].low
-      );
-
-  }
-
-
-  const last =
-    recent[
-      recent.length - 1
-    ];
-
-
-  const previous =
-    recent[
-      recent.length - 2
-    ];
-
-
-  if (
-    last.close >
-    highest
-  ) {
-
-    return "BULLISH";
-
-  }
-
-
-  if (
-    last.close <
-    lowest
-  ) {
-
-    return "BEARISH";
-
-  }
-
-
-  if (
-    last.close >
-      previous.close &&
-    last.low >=
-      previous.low
-  ) {
-
-    return "BULLISH";
-
-  }
-
-
-  if (
-    last.close <
-      previous.close &&
-    last.high <=
-      previous.high
-  ) {
-
-    return "BEARISH";
-
-  }
-
-
-  return "NEUTRAL";
-
-}
-
-
-// =====================================================
-// LIQUIDITY SWEEP
-// =====================================================
-
-function getLiquiditySweep(
-  candles
-) {
-
-  if (
-    candles.length < 15
-  ) {
-
+function getLiquiditySweep(candles) {
+  if (!candles || candles.length < 15) {
     return "NONE";
-
   }
 
+  const last = candles[candles.length - 1];
 
-  const last =
-    candles[
-      candles.length - 1
-    ];
+  const previous = candles.slice(
+    Math.max(0, candles.length - 11),
+    candles.length - 1
+  );
 
+  if (!previous.length) {
+    return "NONE";
+  }
 
-  const previousCandles =
-    candles.slice(
-      -11,
-      -1
-    );
+  const previousLow = Math.min(
+    ...previous.map(c => c.low)
+  );
 
+  const previousHigh = Math.max(
+    ...previous.map(c => c.high)
+  );
 
-  const previousHigh =
-    Math.max(
-      ...previousCandles.map(
-        c => c.high
-      )
-    );
+  /*
+    Bullish liquidity sweep:
+    price takes previous low and closes back above it.
+  */
 
-
-  const previousLow =
-    Math.min(
-      ...previousCandles.map(
-        c => c.low
-      )
-    );
-
-
-  // Price swept below liquidity
-  // and closed back above it.
   if (
-    last.low <
-      previousLow &&
-    last.close >
-      previousLow
+    last.low < previousLow &&
+    last.close > previousLow
   ) {
-
     return "BULLISH LIQUIDITY SWEEP";
-
   }
 
+  /*
+    Bearish liquidity sweep:
+    price takes previous high and closes back below it.
+  */
 
-  // Price swept above liquidity
-  // and closed back below it.
   if (
-    last.high >
-      previousHigh &&
-    last.close <
-      previousHigh
+    last.high > previousHigh &&
+    last.close < previousHigh
   ) {
-
     return "BEARISH LIQUIDITY SWEEP";
-
   }
-
 
   return "NONE";
-
 }
 
+/*
+=========================================================
+STRONG BURST FADER
+=========================================================
 
-// =====================================================
-// STRONG BURST FADER
-// =====================================================
-//
-// This is the important part.
-//
-// EMA20
-// ATR14
-// Upper = EMA20 + 2 ATR
-// Lower = EMA20 - 2 ATR
-//
-// Burst stack measures how far price extends
-// beyond the normal ATR band.
-//
-// The FADER interprets:
-//
-// DOWN BURST -> possible bullish reversal
-// UP BURST   -> possible bearish reversal
-//
-// It is a SUPPORTING confirmation.
-// It does NOT have to be active for every trade.
-// =====================================================
+This is the server-side version of the Pine idea:
 
-function strongBurstFader(
-  candles
-) {
+EMA20
+ATR14
+Upper = EMA20 + 2 ATR
+Lower = EMA20 - 2 ATR
 
-  if (
-    candles.length < 30
-  ) {
+Stack:
+1 = first burst
+2 = EARLY WARNING
+3 = STRONG WARNING
+4-6 = EXTREME area
 
+The Fader assumes:
+UP burst -> possible SELL reversal
+DOWN burst -> possible BUY reversal
+
+IMPORTANT:
+It is SUPPORTING information.
+It does NOT force or block a trade.
+=========================================================
+*/
+
+function getBurstFader(candles) {
+  if (!candles || candles.length < 30) {
     return {
-
       signal: "NEUTRAL",
-
       heat: "COOL",
-
       stack: 0,
-
       fadeBias: "NEUTRAL",
-
       strength: 0,
-
       basis: null,
-
       upper: null,
-
       lower: null
-
     };
-
   }
 
+  /*
+    Last candle is already completed because
+    cleanCandles() removes the live candle.
+  */
 
-  const closes =
-    candles.map(
-      c => c.close
-    );
+  const last = candles[candles.length - 1];
 
+  const closes = candles.map(c => c.close);
 
-  const basis =
-    ema(
-      closes,
-      20
-    );
+  const basis = ema(closes, 20);
 
-
-  const atrValue =
-    atr(
-      candles,
-      14
-    );
-
+  const atrValue = atr(candles, 14);
 
   if (
-    basis === null ||
-    atrValue === null ||
+    !Number.isFinite(basis) ||
+    !Number.isFinite(atrValue) ||
     atrValue <= 0
   ) {
-
     return {
-
       signal: "NEUTRAL",
-
       heat: "COOL",
-
       stack: 0,
-
       fadeBias: "NEUTRAL",
-
       strength: 0,
-
-      basis: null,
-
+      basis,
       upper: null,
-
       lower: null
-
     };
-
   }
-
 
   const upper =
-    basis +
-    2 * atrValue;
-
+    basis + (2 * atrValue);
 
   const lower =
-    basis -
-    2 * atrValue;
+    basis - (2 * atrValue);
 
-
-  const last =
-    candles[
-      candles.length - 1
-    ];
-
-
-  let signal =
-    "NEUTRAL";
-
-
+  let signal = "NEUTRAL";
   let stack = 0;
+  let strength = 0;
 
+  /*
+    UP BURST
+  */
 
-  // ===================================================
-  // UP BURST
-  // ===================================================
-
-  if (
-    last.high >
-    upper
-  ) {
-
-    signal =
-      "UP BURST";
-
+  if (last.high > upper) {
+    signal = "UP BURST";
 
     const extension =
-      last.high -
-      upper;
+      last.high - upper;
 
+    stack = Math.ceil(
+      extension / (0.5 * atrValue)
+    );
 
-    stack =
-      Math.min(
-        6,
-        Math.max(
-          1,
-          Math.ceil(
-            extension /
-              (0.5 * atrValue)
-          )
-        )
-      );
+    stack = Math.max(
+      1,
+      Math.min(6, stack)
+    );
 
+    strength = stack;
   }
 
+  /*
+    DOWN BURST
+  */
 
-  // ===================================================
-  // DOWN BURST
-  // ===================================================
-
-  else if (
-    last.low <
-    lower
-  ) {
-
-    signal =
-      "DOWN BURST";
-
+  else if (last.low < lower) {
+    signal = "DOWN BURST";
 
     const extension =
-      lower -
-      last.low;
+      lower - last.low;
 
+    stack = Math.ceil(
+      extension / (0.5 * atrValue)
+    );
 
-    stack =
-      Math.min(
-        6,
-        Math.max(
-          1,
-          Math.ceil(
-            extension /
-              (0.5 * atrValue)
-          )
-        )
-      );
+    stack = Math.max(
+      1,
+      Math.min(6, stack)
+    );
 
+    strength = stack;
   }
 
+  let heat = "COOL";
 
-  let heat =
-    "COOL";
-
-
-  if (
-    stack >= 5
-  ) {
-
-    heat =
-      "EXTREME";
-
+  if (stack >= 5) {
+    heat = "EXTREME";
+  } else if (stack >= 3) {
+    heat = "HOT";
+  } else if (stack >= 1) {
+    heat = "WARM";
   }
 
-  else if (
-    stack >= 3
-  ) {
+  let fadeBias = "NEUTRAL";
 
-    heat =
-      "HOT";
-
+  if (signal === "UP BURST") {
+    fadeBias = "BEARISH";
   }
 
-  else if (
-    stack >= 1
-  ) {
-
-    heat =
-      "WARM";
-
+  if (signal === "DOWN BURST") {
+    fadeBias = "BULLISH";
   }
-
-
-  // ===================================================
-  // FADER LOGIC
-  // ===================================================
-
-  let fadeBias =
-    "NEUTRAL";
-
-
-  if (
-    signal ===
-      "DOWN BURST" &&
-    stack >= 1
-  ) {
-
-    fadeBias =
-      "BULLISH";
-
-  }
-
-
-  if (
-    signal ===
-      "UP BURST" &&
-    stack >= 1
-  ) {
-
-    fadeBias =
-      "BEARISH";
-
-  }
-
 
   return {
-
     signal,
-
     heat,
-
     stack,
-
     fadeBias,
-
-    strength:
-      stack,
-
+    strength,
     basis,
-
     upper,
-
     lower
-
   };
-
 }
 
+/*
+=========================================================
+BURST SUPPORT
+=========================================================
+*/
 
-// =====================================================
-// BURST + LIQUIDITY CONFIRMATION
-// =====================================================
-
-function getBurstConfirmation(
+function getBurstSupport(
   burst,
   liquidity,
   structure
 ) {
+  let supportsBuy = false;
+  let supportsSell = false;
 
-  let bullish = false;
-  let bearish = false;
-
-
-  // Strong downside burst
-  // followed by bullish liquidity/structure
-  // = strong fader BUY support.
   if (
-    burst.signal ===
-      "DOWN BURST"
+    burst.signal === "DOWN BURST" &&
+    (
+      liquidity === "BULLISH LIQUIDITY SWEEP" ||
+      structure.startsWith("BULLISH")
+    )
   ) {
-
-    if (
-      liquidity ===
-        "BULLISH LIQUIDITY SWEEP" ||
-      structure ===
-        "BULLISH"
-    ) {
-
-      bullish = true;
-
-    }
-
+    supportsBuy = true;
   }
 
-
-  // Strong upside burst
-  // followed by bearish liquidity/structure
-  // = strong fader SELL support.
   if (
-    burst.signal ===
-      "UP BURST"
+    burst.signal === "UP BURST" &&
+    (
+      liquidity === "BEARISH LIQUIDITY SWEEP" ||
+      structure.startsWith("BEARISH")
+    )
   ) {
-
-    if (
-      liquidity ===
-        "BEARISH LIQUIDITY SWEEP" ||
-      structure ===
-        "BEARISH"
-    ) {
-
-      bearish = true;
-
-    }
-
+    supportsSell = true;
   }
-
 
   return {
-
-    bullish,
-
-    bearish
-
+    supportsBuy,
+    supportsSell
   };
-
 }
 
+/*
+=========================================================
+BURST WARNING STAGE
+=========================================================
+*/
 
-// =====================================================
-// PRICE DECIMALS
-// =====================================================
-
-function getDecimals(
-  symbol
-) {
-
+function getBurstWarningStage(result) {
   if (
-    /XAU|GOLD/i.test(
-      symbol
-    )
+    !result ||
+    !result.burstSignal ||
+    result.burstSignal === "NEUTRAL"
   ) {
-
-    return 2;
-
+    return null;
   }
 
-
-  if (
-    /JPY/i.test(
-      symbol
-    )
-  ) {
-
-    return 3;
-
+  if (!Number.isFinite(result.burstStack)) {
+    return null;
   }
 
+  /*
+    Stack 1:
+    normal burst information only.
 
-  return 5;
+    Stack 2:
+    EARLY WARNING.
 
+    Stack 3+:
+    STRONG WARNING.
+  */
+
+  if (result.burstStack >= 3) {
+    return "STRONG";
+  }
+
+  if (result.burstStack >= 2) {
+    return "EARLY";
+  }
+
+  return null;
 }
 
+/*
+=========================================================
+SHOULD SEND BURST WARNING
+=========================================================
 
-function roundPrice(
-  value,
-  decimals
-) {
+Important anti-spam logic:
 
-  return Number(
-    Number(value).toFixed(
-      decimals
-    )
+- First stack 2 -> warning
+- Stack 3 -> strong warning
+- Stack 4/5/6 -> no repeated warnings
+- Stack drops from 3 to 2 -> no downgrade warning
+- Burst disappears -> state resets
+- New burst later -> warning can fire again
+- Burst changes direction -> new warning
+=========================================================
+*/
+
+function shouldSendBurstWarning(result) {
+  const stage =
+    getBurstWarningStage(result);
+
+  /*
+    No meaningful warning.
+    Reset so the next fresh burst can warn.
+  */
+
+  if (!stage) {
+    burstWarningState.delete(result.symbol);
+    return false;
+  }
+
+  const previous =
+    burstWarningState.get(result.symbol);
+
+  /*
+    First warning for this burst.
+  */
+
+  if (!previous) {
+    burstWarningState.set(
+      result.symbol,
+      {
+        signal: result.burstSignal,
+        stage,
+        stack: result.burstStack,
+        time: Date.now()
+      }
+    );
+
+    return true;
+  }
+
+  /*
+    Burst direction changed.
+  */
+
+  if (
+    previous.signal !==
+    result.burstSignal
+  ) {
+    burstWarningState.set(
+      result.symbol,
+      {
+        signal: result.burstSignal,
+        stage,
+        stack: result.burstStack,
+        time: Date.now()
+      }
+    );
+
+    return true;
+  }
+
+  /*
+    Upgrade:
+    EARLY -> STRONG
+  */
+
+  if (
+    previous.stage === "EARLY" &&
+    stage === "STRONG"
+  ) {
+    burstWarningState.set(
+      result.symbol,
+      {
+        signal: result.burstSignal,
+        stage,
+        stack: result.burstStack,
+        time: Date.now()
+      }
+    );
+
+    return true;
+  }
+
+  /*
+    No new warning.
+  */
+
+  return false;
+}
+
+/*
+=========================================================
+TELEGRAM REQUEST
+=========================================================
+*/
+
+async function sendTelegramMessage(message) {
+  if (
+    !TELEGRAM_BOT_TOKEN ||
+    !TELEGRAM_CHAT_ID
+  ) {
+    console.log(
+      "Telegram credentials not configured."
+    );
+
+    return false;
+  }
+
+  const url =
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+
+      headers: {
+        "Content-Type":
+          "application/json"
+      },
+
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: message
+      })
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.ok) {
+      console.error(
+        "Telegram error:",
+        data
+      );
+
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error(
+      "Telegram request failed:",
+      error.message
+    );
+
+    return false;
+  }
+}
+
+/*
+=========================================================
+BURST WARNING TELEGRAM
+=========================================================
+*/
+
+async function sendBurstWarning(result) {
+  if (
+    !TELEGRAM_BOT_TOKEN ||
+    !TELEGRAM_CHAT_ID
+  ) {
+    return false;
+  }
+
+  const stage =
+    getBurstWarningStage(result);
+
+  if (!stage) {
+    return false;
+  }
+
+  if (!shouldSendBurstWarning(result)) {
+    return false;
+  }
+
+  const isUp =
+    result.burstSignal === "UP BURST";
+
+  const possibleDirection =
+    isUp ? "SELL" : "BUY";
+
+  const emoji =
+    stage === "STRONG"
+      ? "🚨"
+      : "⚠️";
+
+  const title =
+    stage === "STRONG"
+      ? "STRONG BURST WARNING"
+      : "EARLY BURST WARNING";
+
+  const message =
+`${emoji} ${title}
+
+📌 ${result.symbol}
+
+⚡ Burst: ${result.burstSignal}
+🔥 Heat: ${result.burstHeat}
+📈 Stack: ${result.burstStack}/6
+🧭 Possible reversal: ${possibleDirection}
+
+📊 H1: ${result.h1Direction}
+📊 M15: ${result.m15Direction}
+📊 M5: ${result.m5Direction}
+
+🏗️ M15 Structure:
+${result.m15Structure}
+
+🏗️ M5 Structure:
+${result.m5Structure}
+
+🔎 Liquidity:
+${result.liquidity}
+
+💡 Burst Fader:
+${result.burstFadeBias}
+
+⏳ WAIT FOR CONFIRMATION
+
+This is a warning, NOT an entry signal.
+
+The bot will still wait for its normal H1 → M15 → M5 confirmation before sending a BUY/SELL signal.`;
+
+  return sendTelegramMessage(message);
+}
+
+/*
+=========================================================
+NORMAL ALERT
+=========================================================
+*/
+
+async function sendTelegramAlert(result) {
+  if (
+    !TELEGRAM_BOT_TOKEN ||
+    !TELEGRAM_CHAT_ID
+  ) {
+    return false;
+  }
+
+  if (
+    result.signal !== "BUY" &&
+    result.signal !== "SELL"
+  ) {
+    return false;
+  }
+
+  const now = Date.now();
+
+  const previous =
+    alertState.get(result.symbol) || 0;
+
+  /*
+    Normal trade alert cooldown.
+  */
+
+  if (
+    now - previous <
+    ALERT_COOLDOWN_MS
+  ) {
+    return false;
+  }
+
+  alertState.set(
+    result.symbol,
+    now
   );
 
+  const decimals =
+    getDecimals(result.symbol);
+
+  const emoji =
+    result.signal === "BUY"
+      ? "🟢"
+      : "🔴";
+
+  const message =
+`${emoji} STRONG ${result.signal}: ${result.symbol}
+
+📍 Entry: ${formatPrice(result.entry, decimals)}
+🛑 Stop Loss: ${formatPrice(result.stopLoss, decimals)}
+🎯 Take Profit: ${formatPrice(result.takeProfit, decimals)}
+
+⭐ Score: ${result.score}/${result.maxScore}
+
+📊 H1: ${result.h1Direction}
+📊 M15: ${result.m15Direction}
+📊 M5: ${result.m5Direction}
+
+🏗️ M15 Structure:
+${result.m15Structure}
+
+🏗️ M5 Structure:
+${result.m5Structure}
+
+🔎 Liquidity:
+${result.liquidity}
+
+⚡ Burst Fader:
+${result.burstSignal}
+
+🔥 Burst Heat:
+${result.burstHeat}
+
+📈 Burst Stack:
+${result.burstStack}/6
+
+🧭 Burst Fade Bias:
+${result.burstFadeBias}
+
+RSI: ${Number.isFinite(result.rsi) ? result.rsi.toFixed(1) : "N/A"}
+
+⏱️ 1:2 Risk/Reward`;
+
+  return sendTelegramMessage(message);
 }
 
+/*
+=========================================================
+ANALYSE ONE SYMBOL
+=========================================================
+*/
 
-// =====================================================
-// ANALYZE SYMBOL
-// =====================================================
+async function analyzeSymbol(symbol) {
+  console.log(
+    `Analyzing ${symbol}...`
+  );
 
-async function analyzeSymbol(
-  symbol
-) {
-
-  // -----------------------------------------------
-  // H1
-  // -----------------------------------------------
+  /*
+    H1
+  */
 
   const h1Data =
     await getCandles(
@@ -1707,16 +1310,11 @@ async function analyzeSymbol(
       H1_GRANULARITY
     );
 
+  await sleep(250);
 
-  const h1 =
-    cleanCandles(
-      h1Data
-    );
-
-
-  // -----------------------------------------------
-  // M15
-  // -----------------------------------------------
+  /*
+    M15
+  */
 
   const m15Data =
     await getCandles(
@@ -1724,16 +1322,11 @@ async function analyzeSymbol(
       M15_GRANULARITY
     );
 
+  await sleep(250);
 
-  const m15 =
-    cleanCandles(
-      m15Data
-    );
-
-
-  // -----------------------------------------------
-  // M5
-  // -----------------------------------------------
+  /*
+    M5
+  */
 
   const m5Data =
     await getCandles(
@@ -1741,547 +1334,373 @@ async function analyzeSymbol(
       M5_GRANULARITY
     );
 
+  const h1 =
+    cleanCandles(h1Data);
+
+  const m15 =
+    cleanCandles(m15Data);
 
   const m5 =
-    cleanCandles(
-      m5Data
-    );
-
+    cleanCandles(m5Data);
 
   if (
     h1.length < 30 ||
     m15.length < 30 ||
     m5.length < 30
   ) {
-
     throw new Error(
-      `Insufficient candle data for ${symbol}`
+      `Not enough candles for ${symbol}`
     );
-
   }
 
-
-  // -----------------------------------------------
-  // ANALYSIS
-  // -----------------------------------------------
+  /*
+    DIRECTIONS
+  */
 
   const h1Direction =
-    getDirection(
-      h1
-    );
-
+    getDirection(h1);
 
   const m15Direction =
-    getDirection(
-      m15
-    );
-
+    getDirection(m15);
 
   const m5Direction =
-    getDirection(
-      m5
-    );
+    getDirection(m5);
 
+  /*
+    STRUCTURE
+  */
 
   const m15Structure =
-    getStructure(
-      m15
-    );
-
+    getStructure(m15);
 
   const m5Structure =
-    getStructure(
-      m5
-    );
+    getStructure(m5);
 
+  /*
+    LIQUIDITY
+  */
 
   const liquidity =
-    getLiquiditySweep(
-      m5
-    );
+    getLiquiditySweep(m5);
 
+  /*
+    BURST FADER
+  */
 
   const burst =
-    strongBurstFader(
-      m5
-    );
+    getBurstFader(m5);
 
+  /*
+    BURST SUPPORT
+  */
 
-  const burstConfirmation =
-    getBurstConfirmation(
+  const burstSupport =
+    getBurstSupport(
       burst,
       liquidity,
       m5Structure
     );
 
+  /*
+    RSI
+  */
 
   const rsiValue =
-    rsi(
-      m5,
-      14
-    );
+    rsi(m5, 14);
 
+  /*
+    ATR
+  */
 
   const atrValue =
-    atr(
-      m5,
-      14
-    );
+    atr(m5, 14);
 
-
-  const last =
-    m5[
-      m5.length - 1
-    ];
-
-
-  // =================================================
-  // DETERMINE PRIMARY DIRECTION
-  // =================================================
-
-  let direction =
-    "WAIT";
-
-
-  if (
-    h1Direction ===
-      "BULLISH" &&
-    m15Direction ===
-      "BULLISH"
-  ) {
-
-    direction =
-      "BUY";
-
-  }
-
-
-  if (
-    h1Direction ===
-      "BEARISH" &&
-    m15Direction ===
-      "BEARISH"
-  ) {
-
-    direction =
-      "SELL";
-
-  }
-
-
-  // =================================================
-  // SCORE
-  // =================================================
+  /*
+    SCORE
+  */
 
   let buyScore = 0;
   let sellScore = 0;
 
+  /*
+    H1
+  */
 
-  // H1
-  if (
-    h1Direction ===
-    "BULLISH"
-  ) {
-
+  if (h1Direction === "BULLISH") {
     buyScore++;
-
   }
 
-
-  if (
-    h1Direction ===
-    "BEARISH"
-  ) {
-
+  if (h1Direction === "BEARISH") {
     sellScore++;
-
   }
 
+  /*
+    M15 direction
+  */
 
-  // M15 direction
-  if (
-    m15Direction ===
-    "BULLISH"
-  ) {
-
+  if (m15Direction === "BULLISH") {
     buyScore++;
-
   }
 
-
-  if (
-    m15Direction ===
-    "BEARISH"
-  ) {
-
+  if (m15Direction === "BEARISH") {
     sellScore++;
-
   }
 
+  /*
+    M15 structure
+  */
 
-  // M15 structure
   if (
-    m15Structure ===
-    "BULLISH"
+    m15Structure.startsWith("BULLISH")
   ) {
-
     buyScore++;
-
   }
 
-
   if (
-    m15Structure ===
-    "BEARISH"
+    m15Structure.startsWith("BEARISH")
   ) {
-
     sellScore++;
-
   }
 
+  /*
+    M5 structure
+  */
 
-  // M5 structure
   if (
-    m5Structure ===
-    "BULLISH"
+    m5Structure.startsWith("BULLISH")
   ) {
-
     buyScore++;
-
   }
 
-
   if (
-    m5Structure ===
-    "BEARISH"
+    m5Structure.startsWith("BEARISH")
   ) {
-
     sellScore++;
-
   }
 
+  /*
+    Burst support
+  */
 
-  // =================================================
-  // STRONG BURST FADER
-  // =================================================
-  //
-  // IMPORTANT:
-  // This is NOT a mandatory condition.
-  //
-  // It adds a point when it supports the setup.
-  // =================================================
-
-  if (
-    burstConfirmation.bullish
-  ) {
-
+  if (burstSupport.supportsBuy) {
     buyScore++;
-
   }
 
-
-  if (
-    burstConfirmation.bearish
-  ) {
-
+  if (burstSupport.supportsSell) {
     sellScore++;
-
   }
 
-
-  // =================================================
-  // LIQUIDITY BONUS
-  // =================================================
+  /*
+    Liquidity
+  */
 
   if (
     liquidity ===
-      "BULLISH LIQUIDITY SWEEP"
+    "BULLISH LIQUIDITY SWEEP"
   ) {
-
     buyScore++;
-
   }
-
 
   if (
     liquidity ===
-      "BEARISH LIQUIDITY SWEEP"
+    "BEARISH LIQUIDITY SWEEP"
   ) {
-
     sellScore++;
-
   }
 
+  /*
+    Maximum score remains 5.
 
-  // =================================================
-  // CAP SCORE AT 5
-  // =================================================
+    This prevents the extra confirmations
+    from making the bot artificially stricter.
+  */
 
   buyScore =
-    Math.min(
-      5,
-      buyScore
-    );
-
+    Math.min(5, buyScore);
 
   sellScore =
-    Math.min(
-      5,
-      sellScore
-    );
+    Math.min(5, sellScore);
 
+  /*
+    FINAL SIGNAL
 
-  // =================================================
-  // FINAL SIGNAL
-  // =================================================
+    Burst Fader is NOT mandatory.
+  */
 
-  let signal =
-    "WAIT";
-
-
-  let score = 0;
-
-
-  // -----------------------------------------------
-  // BUY
-  // -----------------------------------------------
-
-  const buyStructureOK =
-    m15Structure ===
-      "BULLISH" ||
-    m5Structure ===
-      "BULLISH" ||
-    burstConfirmation.bullish;
-
-
-  const sellStructureOK =
-    m15Structure ===
-      "BEARISH" ||
-    m5Structure ===
-      "BEARISH" ||
-    burstConfirmation.bearish;
-
+  let signal = "WAIT";
 
   if (
-    h1Direction ===
-      "BULLISH" &&
-    m15Direction ===
-      "BULLISH" &&
-    buyStructureOK &&
+    h1Direction === "BULLISH" &&
+    m15Direction === "BULLISH" &&
+    (
+      m15Structure.startsWith("BULLISH") ||
+      m5Structure.startsWith("BULLISH") ||
+      burstSupport.supportsBuy
+    ) &&
     buyScore >= 3
   ) {
-
-    signal =
-      "BUY";
-
-    score =
-      buyScore;
-
+    signal = "BUY";
   }
-
-
-  // -----------------------------------------------
-  // SELL
-  // -----------------------------------------------
 
   if (
-    h1Direction ===
-      "BEARISH" &&
-    m15Direction ===
-      "BEARISH" &&
-    sellStructureOK &&
+    h1Direction === "BEARISH" &&
+    m15Direction === "BEARISH" &&
+    (
+      m15Structure.startsWith("BEARISH") ||
+      m5Structure.startsWith("BEARISH") ||
+      burstSupport.supportsSell
+    ) &&
     sellScore >= 3
   ) {
-
-    signal =
-      "SELL";
-
-    score =
-      sellScore;
-
+    signal = "SELL";
   }
 
+  /*
+    FINAL SCORE
+  */
 
-  // =================================================
-  // ENTRY / SL / TP
-  // =================================================
+  const score =
+    signal === "BUY"
+      ? buyScore
+      : signal === "SELL"
+        ? sellScore
+        : Math.max(
+            buyScore,
+            sellScore
+          );
 
-  const decimals =
-    getDecimals(
-      symbol
-    );
+  /*
+    ENTRY
+  */
 
+  const lastM5 =
+    m5[m5.length - 1];
 
   const entry =
-    roundPrice(
-      last.close,
-      decimals
-    );
+    lastM5.close;
 
+  /*
+    STOP LOSS
+  */
 
-  let stopLoss;
-  let takeProfit;
-
-
-  const recent =
+  const recentM5 =
     m5.slice(
-      -8
+      Math.max(0, m5.length - 8)
     );
-
-
-  const recentHigh =
-    Math.max(
-      ...recent.map(
-        c => c.high
-      )
-    );
-
 
   const recentLow =
     Math.min(
-      ...recent.map(
-        c => c.low
-      )
+      ...recentM5.map(c => c.low)
     );
 
+  const recentHigh =
+    Math.max(
+      ...recentM5.map(c => c.high)
+    );
 
-  const buffer =
-    atrValue
-      ? atrValue *
-        0.20
-      : entry *
-        0.001;
+  let stopLoss = null;
+  let takeProfit = null;
 
+  const decimals =
+    getDecimals(symbol);
 
   if (
-    signal ===
-    "BUY"
+    signal === "BUY" &&
+    Number.isFinite(atrValue)
   ) {
-
     stopLoss =
       recentLow -
-      buffer;
-
+      (atrValue * 0.2);
 
     const risk =
-      entry -
-      stopLoss;
-
+      entry - stopLoss;
 
     takeProfit =
       entry +
-      risk * 2;
-
+      (risk * 2);
   }
 
-
-  else if (
-    signal ===
-    "SELL"
+  if (
+    signal === "SELL" &&
+    Number.isFinite(atrValue)
   ) {
-
     stopLoss =
       recentHigh +
-      buffer;
-
+      (atrValue * 0.2);
 
     const risk =
-      stopLoss -
-      entry;
-
+      stopLoss - entry;
 
     takeProfit =
       entry -
-      risk * 2;
-
+      (risk * 2);
   }
 
+  /*
+    BURST WARNING STAGE
+  */
 
-  else {
+  let burstWarningStage =
+    "NONE";
 
-    stopLoss = null;
-
-    takeProfit = null;
-
+  if (burst.stack >= 3) {
+    burstWarningStage =
+      "STRONG";
+  } else if (burst.stack >= 2) {
+    burstWarningStage =
+      "EARLY";
   }
 
-
-  if (
-    stopLoss !== null
-  ) {
-
-    stopLoss =
-      roundPrice(
-        stopLoss,
-        decimals
-      );
-
-  }
-
-
-  if (
-    takeProfit !== null
-  ) {
-
-    takeProfit =
-      roundPrice(
-        takeProfit,
-        decimals
-      );
-
-  }
-
-
-  // =================================================
-  // RETURN
-  // =================================================
+  /*
+    RETURN RESULT
+  */
 
   return {
-
     symbol,
 
-    price:
+    price: round(
       entry,
+      decimals
+    ),
 
     signal,
 
     score,
 
-    maxScore:
-      5,
+    maxScore: 5,
 
-    entry,
+    entry:
+      Number.isFinite(entry)
+        ? round(entry, decimals)
+        : null,
 
-    stopLoss,
+    stopLoss:
+      Number.isFinite(stopLoss)
+        ? round(stopLoss, decimals)
+        : null,
 
-    takeProfit,
+    takeProfit:
+      Number.isFinite(takeProfit)
+        ? round(takeProfit, decimals)
+        : null,
 
-    h1:
-      h1Direction,
-
+    h1: h1Direction,
     h1Direction,
 
-    m15:
-      m15Direction,
-
+    m15: m15Direction,
     m15Direction,
 
-    m5:
-      m5Direction,
-
+    m5: m5Direction,
     m5Direction,
 
     m15Structure,
-
     m5Structure,
 
     liquidity,
 
-    liquiditySweep:
-      liquidity,
+    liquiditySweep: liquidity,
 
-    burstFader:
-      burst.signal,
+    burstFader: burst.signal,
 
     burstSignal:
       burst.signal,
@@ -2299,364 +1718,213 @@ async function analyzeSymbol(
       burst.strength,
 
     burstSupportsBuy:
-      burstConfirmation.bullish,
+      burstSupport.supportsBuy,
 
     burstSupportsSell:
-      burstConfirmation.bearish,
+      burstSupport.supportsSell,
+
+    burstWarningStage,
 
     rsi:
-      rsiValue === null
-        ? null
-        : Number(
-            rsiValue.toFixed(
-              1
-            )
-          ),
+      Number.isFinite(rsiValue)
+        ? round(rsiValue, 2)
+        : null,
 
     atr:
-      atrValue,
+      Number.isFinite(atrValue)
+        ? round(atrValue, decimals)
+        : null,
 
     timestamp:
       new Date().toISOString()
-
   };
-
 }
 
-
-// =====================================================
-// TELEGRAM
-// =====================================================
-
-async function sendTelegram(
-  result
-) {
-
-  if (
-    !TELEGRAM_BOT_TOKEN ||
-    !TELEGRAM_CHAT_ID
-  ) {
-
-    return;
-
-  }
-
-
-  if (
-    result.signal !==
-      "BUY" &&
-    result.signal !==
-      "SELL"
-  ) {
-
-    return;
-
-  }
-
-
-  const now =
-    Date.now();
-
-
-  const previous =
-    alertHistory.get(
-      result.symbol
-    ) || 0;
-
-
-  if (
-    now - previous <
-    ALERT_COOLDOWN_MS
-  ) {
-
-    return;
-
-  }
-
-
-  alertHistory.set(
-    result.symbol,
-    now
-  );
-
-
-  const emoji =
-    result.signal ===
-      "BUY"
-      ? "🟢"
-      : "🔴";
-
-
-  const message =
-
-`${emoji} STRONG ${result.signal}: ${result.symbol}
-
-📍 Entry: ${result.entry}
-🛑 Stop Loss: ${result.stopLoss}
-🎯 Take Profit: ${result.takeProfit}
-
-⭐ Score: ${result.score}/5
-
-📊 H1: ${result.h1Direction}
-📊 M15: ${result.m15Direction}
-📊 M5: ${result.m5Direction}
-
-🏗️ M15 Structure: ${result.m15Structure}
-🏗️ M5 Structure: ${result.m5Structure}
-
-🔎 Liquidity: ${result.liquidity}
-
-⚡ Burst Fader: ${result.burstSignal}
-🔥 Burst Heat: ${result.burstHeat}
-📈 Burst Stack: ${result.burstStack}
-🧭 Burst Fade Bias: ${result.burstFadeBias}
-
-RSI: ${result.rsi ?? "N/A"}
-
-⚠️ Scanner alert only — confirm before trading.`;
-
-
-  const url =
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-
-  try {
-
-    await fetch(
-      url,
-      {
-
-        method:
-          "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json"
-        },
-
-        body:
-          JSON.stringify({
-
-            chat_id:
-              TELEGRAM_CHAT_ID,
-
-            text:
-              message
-
-          })
-
-      }
-    );
-
-  } catch (error) {
-
-    console.log(
-      "Telegram error:",
-      error.message
-    );
-
-  }
-
-}
-
-
-// =====================================================
-// SCANNER
-// =====================================================
-
-let scanning = false;
-
+/*
+=========================================================
+SCAN ALL MARKETS
+=========================================================
+*/
 
 async function scanMarkets() {
-
-  if (
-    scanning
-  ) {
-
-    return;
-
-  }
-
-
-  scanning = true;
-
-
   try {
+    state.error = null;
 
     const symbols =
       await getActiveSymbols();
 
+    console.log(
+      `Found ${symbols.length} Volatility symbols.`
+    );
 
     const results = [];
 
+    /*
+      Sequential scanning helps reduce
+      WebSocket/API pressure.
+    */
 
-    console.log(
-      `Found ${symbols.length} Volatility symbols`
-    );
-
-
-    for (
-      const item of symbols
-    ) {
-
+    for (const item of symbols) {
       try {
-
         const result =
           await analyzeSymbol(
             item.symbol
           );
 
+        results.push(result);
 
-        results.push(
+        /*
+          BURST WARNING FIRST.
+
+          This means the user can receive:
+          ⚠️ Burst warning
+          before a later normal signal.
+
+          It does NOT change the signal itself.
+        */
+
+        await sendBurstWarning(
           result
         );
 
+        /*
+          Normal trade alert.
+        */
 
-        console.log(
-          `${item.symbol} | ` +
-          `H1 ${result.h1Direction} | ` +
-          `M15 ${result.m15Structure} | ` +
-          `M5 ${result.m5Structure} | ` +
-          `Burst ${result.burstSignal} | ` +
-          `Heat ${result.burstHeat} | ` +
-          `Stack ${result.burstStack} | ` +
-          `Liquidity ${result.liquidity} | ` +
-          `${result.signal} ${result.score}/5`
-        );
-
-
-        await sendTelegram(
+        await sendTelegramAlert(
           result
         );
 
-
-        // Small delay between symbols.
-        await new Promise(
-          resolve =>
-            setTimeout(
-              resolve,
-              250
-            )
-        );
-
-
+        await sleep(250);
       } catch (error) {
-
-        console.log(
-          `Scan error for ${item.symbol}:`,
+        console.error(
+          `Analysis failed for ${item.symbol}:`,
           error.message
         );
 
+        results.push({
+          symbol: item.symbol,
+          signal: "ERROR",
+          score: 0,
+          maxScore: 5,
+          error: error.message,
+          timestamp:
+            new Date().toISOString()
+        });
       }
-
     }
 
-
-    state.markets =
-      results;
-
-
+    state.markets = results;
     state.lastScan =
       new Date().toISOString();
 
+    state.online = true;
 
-    state.error =
-      null;
-
-
+    console.log(
+      `Scan complete: ${results.length} markets`
+    );
   } catch (error) {
-
     state.error =
       error.message;
 
+    state.online = false;
 
-    console.log(
-      "Scanner error:",
+    console.error(
+      "Scan error:",
       error.message
     );
-
-  } finally {
-
-    scanning =
-      false;
-
   }
-
 }
 
+/*
+=========================================================
+API STATUS
+=========================================================
+*/
 
-// =====================================================
-// STATUS API
-// =====================================================
+app.get("/api/status", (req, res) => {
+  res.json({
+    ok: true,
 
-app.get(
-  "/api/status",
-  (req, res) => {
+    online:
+      state.online,
 
-    res.json({
+    derivConnected:
+      state.derivConnected,
 
-      ok:
-        true,
+    marketOpen: true,
 
-      online:
-        state.online,
+    lastScan:
+      state.lastScan,
 
-      connected:
-        state.connected,
+    error:
+      state.error,
 
-      lastScan:
-        state.lastScan,
+    markets:
+      state.markets
+  });
+});
 
-      symbols:
-        state.symbols,
+/*
+=========================================================
+HEALTH
+=========================================================
+*/
 
-      volatilityIndices:
-        state.symbols.length,
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    online: true,
+    derivConnected:
+      state.derivConnected,
+    time:
+      new Date().toISOString()
+  });
+});
 
-      markets:
-        state.markets,
+/*
+=========================================================
+ROOT
+=========================================================
+*/
 
-      error:
-        state.error
+app.get("/", (req, res) => {
+  res.sendFile(
+    path.join(
+      __dirname,
+      "public",
+      "index.html"
+    )
+  );
+});
 
-    });
-
-  }
-);
-
-
-// =====================================================
-// START SERVER
-// =====================================================
+/*
+=========================================================
+START SERVER
+=========================================================
+*/
 
 app.listen(
   PORT,
   "0.0.0.0",
   () => {
-
     console.log(
       `Deriv Volatility Burst Fader running on port ${PORT}`
     );
 
+    /*
+      Start first scan immediately.
+    */
 
-    setTimeout(
-      () => {
+    scanMarkets();
 
-        scanMarkets();
-
-      },
-      2000
-    );
-
+    /*
+      Continue scanning every 30 seconds.
+    */
 
     setInterval(
-      () => {
-
-        scanMarkets();
-
-      },
+      scanMarkets,
       SCAN_INTERVAL_MS
     );
-
   }
 );
