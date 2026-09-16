@@ -648,21 +648,14 @@ async function requestCandles(
     We do NOT request 3600.
   */
 
-  const data =
-    await derivRequest({
-
-      ticks_history: symbol,
-
-      end: "latest",
-
-      count: CANDLE_COUNT,
-
-      style: "candles",
-
-      granularity,
-
-      subscribe: 0
-    });
+  const data = await derivRequest({
+  ticks_history: symbol,
+  end: "latest",
+  count: CANDLE_COUNT,
+  style: "candles",
+  granularity,
+  adjust_start_time: 1
+});
 
   if (
     data &&
